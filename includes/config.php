@@ -13,16 +13,21 @@ date_default_timezone_set('Asia/Kuala_Lumpur');
 
 // Create database connection
 try {
+    $pdoOptions = [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        PDO::ATTR_EMULATE_PREPARES => false,
+    ];
+
+    if (defined('PDO::MYSQL_ATTR_USE_BUFFERED_QUERY')) {
+        $pdoOptions[PDO::MYSQL_ATTR_USE_BUFFERED_QUERY] = true;
+    }
+
     $pdo = new PDO(
         "mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=utf8mb4",
         DB_USER,
         DB_PASS,
-        [
-            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-            PDO::ATTR_EMULATE_PREPARES => false,
-            PDO::MYSQL_ATTR_USE_BUFFERED_QUERY => true
-        ]
+        $pdoOptions
     );
 } catch (PDOException $e) {
     die("Connection failed: " . $e->getMessage());
