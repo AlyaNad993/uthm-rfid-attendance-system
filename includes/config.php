@@ -1,11 +1,41 @@
 <?php
+define('DB_HOST', $databaseHost);
 // Database Configuration
-// Use Railway-provided environment variables when deployed.
-define('DB_HOST', getenv('DB_HOST') ?: 'localhost');
-define('DB_NAME', getenv('DB_NAME') ?: 'uthm_rfid_attendance');
-define('DB_USER', getenv('DB_USER') ?: 'root');
-define('DB_PASS', getenv('DB_PASS') ?: '');
-define('DB_PORT', getenv('DB_PORT') ?: '3306');
+// Support Railway's injected connection string. Create a service variable
+// (e.g. `MYSQL_URL`) with the value `${{ MySQL.MYSQL_URL }}` and this code
+// will parse it automatically. Falls back to individual env vars for local dev.
+$mysqlUrl = getenv('MYSQL_URL') ?: getenv('DATABASE_URL') ?: false;
+
+if ($mysqlUrl) {
+    $parts = parse_url($mysqlUrl);
+    $dbHost = $parts['host'] ?? '127.0.0.1';
+    $dbPort = isset($parts['port']) ? (string)$parts['port'] : '3306';
+    $dbUser = $parts['user'] ?? 'root';
+    $dbPass = $parts['pass'] ?? '';
+    $dbName = isset($parts['path']) ? ltrim($parts['path'], '/') : 'uthm_rfid_attendance';
+} else {
+    $databaseHost = getenv('DB_HOST');
+    $databaseHost = $databaseHost !== false ? $databaseHost : '127.0.0.1';
+    $databasePort = getenv('DB_PORT');
+    $databasePort = $databasePort !== false ? $databasePort : '3306';
+
+    if ($databaseHost === 'localhost' && !empty($databasePort)) {
+        // Force TCP instead of UNIX socket when a port is specified.
+        $databaseHost = '127.0.0.1';
+    }
+
+    $dbHost = $databaseHost;
+    $dbName = getenv('DB_NAME') ?: 'uthm_rfid_attendance';
+    $dbUser = getenv('DB_USER') ?: 'root';
+    $dbPass = getenv('DB_PASS') ?: '';
+    $dbPort = $databasePort;
+}
+
+define('DB_HOST', $dbHost);
+define('DB_NAME', $dbName);
+define('DB_USER', $dbUser);
+define('DB_PASS', $dbPass);
+define('DB_PORT', $dbPort);
 
 // REMOVE session_start() from here
 // session_start(); // ← COMMENT OR REMOVE THIS LINE
