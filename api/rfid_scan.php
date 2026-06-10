@@ -88,30 +88,9 @@ try {
         }
     }
     
-    // 4. Calculate if late
+    // 4. Record successful scans as present. Late status is not used.
     $status = 'present';
     $late_minutes = 0;
-    
-    if ($reader_info['session_id'] && $card_info['role'] == 'student') {
-        $stmt = $pdo->prepare("
-            SELECT cs.start_time 
-            FROM class_schedule cs
-            JOIN attendance_sessions a_sess ON cs.schedule_id = a_sess.schedule_id
-            WHERE a_sess.session_id = ?
-        ");
-        $stmt->execute([$reader_info['session_id']]);
-        $schedule = $stmt->fetch();
-        
-        if ($schedule) {
-            $start_time = strtotime($schedule['start_time']);
-            $scan_timestamp = strtotime($scan_time);
-            $late_minutes = round(($scan_timestamp - $start_time) / 60);
-            
-            if ($late_minutes > 15) {
-                $status = 'late';
-            }
-        }
-    }
     
     // 5. Insert attendance record
     $stmt = $pdo->prepare("
@@ -137,14 +116,19 @@ try {
     // 6. Update session statistics if applicable
     if ($reader_info['session_id']) {
         $stmt = $pdo->prepare("
-            UPDATE attendance_sessions 
-            SET 
-                total_present = total_present + 1,
-                total_late = total_late + ?,
+        UPDATE attendance_sessions 
+        SET 
+                total_present = (
+                    SELECT COUNT(*)
+                    FROM attendance_records
+                    WHERE session_id = ?
+                      AND status = 'present'
+                ),
+                total_late = 0,
                 session_status = 'ongoing'
             WHERE session_id = ?
         ");
-        $stmt->execute([$status == 'late' ? 1 : 0, $reader_info['session_id']]);
+        $stmt->execute([$reader_info['session_id'], $reader_info['session_id']]);
     }
     
     // 7. Log the scan

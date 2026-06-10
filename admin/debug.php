@@ -1,5 +1,8 @@
 <?php
 // debug.php
+require_once '../includes/auth_check.php';
+requireAdmin();
+
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
 

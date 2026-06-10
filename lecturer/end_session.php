@@ -2,6 +2,8 @@
 require_once '../includes/auth_check.php';
 requireLecturerOrAdmin();
 require_once '../includes/config.php';
+require_once '../includes/attendance_features.php';
+ensureAttendanceFeatureSchema($pdo);
 
 $userRole = $_SESSION['role'] ?? '';
 $userId = (int)($_SESSION['user_id'] ?? 0);
@@ -20,7 +22,9 @@ $sessionSql = "
         s.planned_end_time,
         s.session_status,
         cs.course_id,
-        cs.lecturer_id
+        cs.lecturer_id,
+        cs.section_name,
+        cs.academic_year
     FROM attendance_sessions s
     JOIN class_schedule cs ON s.schedule_id = cs.schedule_id
     WHERE s.session_id = ?
@@ -72,6 +76,8 @@ try {
         FROM enrollments e
         JOIN users u ON e.student_id = u.user_id
         WHERE e.course_id = ?
+          AND e.section_name = ?
+          AND COALESCE(e.academic_year, '') = ?
           AND e.status = 'registered'
           AND u.role = 'student'
           AND u.is_active = 1
@@ -86,6 +92,8 @@ try {
         $sessionId,
         $absentScanTime,
         (int)$session['course_id'],
+        $session['section_name'] ?? 'Section 1',
+        $session['academic_year'] ?? '',
         $sessionId,
     ]);
 
@@ -101,10 +109,7 @@ try {
                   AND status = 'present'
             ),
             total_late = (
-                SELECT COUNT(*)
-                FROM attendance_records
-                WHERE session_id = ?
-                  AND status = 'late'
+                0
             ),
             total_absent = (
                 SELECT COUNT(*)
@@ -114,7 +119,7 @@ try {
             )
         WHERE session_id = ?
     ");
-    $stmt->execute([$sessionId, $sessionId, $sessionId, $sessionId]);
+    $stmt->execute([$sessionId, $sessionId, $sessionId]);
 
     $pdo->commit();
     header('Location: live_attendance.php?session_id=' . $sessionId . '&ended=1');

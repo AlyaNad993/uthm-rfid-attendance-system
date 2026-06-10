@@ -172,6 +172,75 @@ function e($value) {
             .day.outside { display: none; }
         }
     </style>
+    <link rel="stylesheet" href="../assets/css/lecturer-theme.css">
+    <link rel="stylesheet" href="../assets/css/app-polish.css">
+    <link rel="stylesheet" href="../assets/css/lecturer-polish.css">
+    <style>
+        body {
+            background:
+                radial-gradient(circle at 8% 8%, rgba(0, 104, 55, 0.16), transparent 30%),
+                radial-gradient(circle at 92% 10%, rgba(67, 97, 238, 0.14), transparent 28%),
+                linear-gradient(135deg, #f7fbff 0%, #edf8f3 100%) !important;
+        }
+        .page { max-width: 1240px; }
+        .topbar,
+        .calendar {
+            border: 1px solid #dce6f2 !important;
+            border-radius: 18px !important;
+            box-shadow: 0 18px 46px rgba(28, 52, 84, 0.12) !important;
+            background: linear-gradient(180deg, rgba(255,255,255,.98), rgba(250,253,252,.94)) !important;
+        }
+        .topbar {
+            padding: 26px 28px;
+            align-items: center;
+        }
+        .btn {
+            min-height: 46px;
+            border-radius: 12px !important;
+            font-weight: 800;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #006837, #4361ee) !important;
+        }
+        h2 {
+            margin: 0 0 16px;
+            padding: 0 4px;
+            color: #172033 !important;
+            font-size: 24px;
+        }
+        .weekday {
+            background: linear-gradient(90deg, #f1f7fb, #eef8f2) !important;
+            color: #40536b !important;
+        }
+        .day {
+            background: rgba(255,255,255,.9) !important;
+        }
+        .day.today {
+            box-shadow: inset 0 0 0 2px #006837 !important;
+            background: linear-gradient(180deg, #ffffff, #f5fbf8) !important;
+        }
+        .session {
+            border-radius: 10px !important;
+            background: rgba(67, 97, 238, 0.10) !important;
+            border-color: rgba(67, 97, 238, 0.20) !important;
+            color: #24415c !important;
+        }
+        .session.ongoing {
+            background: #dcfce7 !important;
+            color: #166534 !important;
+        }
+        .session.completed {
+            background: #f8fafc !important;
+            color: #475569 !important;
+        }
+        .session.cancelled {
+            background: #fee2e2 !important;
+            color: #991b1b !important;
+        }
+        @media (max-width: 900px) {
+            .calendar { background: transparent !important; box-shadow: none !important; border: 0 !important; }
+        }
+    </style>
 </head>
 <body>
     <main class="page">

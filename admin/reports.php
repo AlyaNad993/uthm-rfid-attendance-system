@@ -1,3 +1,206 @@
+<?php
+require_once '../includes/auth_check.php';
+requireAdmin();
+require_once '../includes/config.php';
+
+$courseFilter = $_GET['course_id'] ?? 'all';
+$lecturerFilter = $_GET['lecturer_id'] ?? 'all';
+$statusFilter = $_GET['status'] ?? 'all';
+$dateFrom = $_GET['date_from'] ?? date('Y-01-01');
+$dateTo = $_GET['date_to'] ?? date('Y-12-31');
+
+if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateFrom)) {
+    $dateFrom = date('Y-01-01');
+}
+
+if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateTo)) {
+    $dateTo = date('Y-12-31');
+}
+
+$courses = $pdo->query("
+    SELECT course_id, course_code, course_name
+    FROM courses
+    WHERE is_active = 1
+    ORDER BY course_code
+")->fetchAll();
+
+$lecturers = $pdo->query("
+    SELECT DISTINCT u.user_id, u.full_name
+    FROM users u
+    JOIN class_schedule cs ON cs.lecturer_id = u.user_id
+    WHERE u.role = 'lecturer'
+      AND u.is_active = 1
+      AND cs.is_active = 1
+    ORDER BY u.full_name
+")->fetchAll();
+
+$reportSql = "
+    SELECT
+        u.user_id,
+        u.matric_no,
+        u.full_name,
+        c.course_id,
+        c.course_code,
+        c.course_name,
+        COUNT(DISTINCT ats.session_id) AS expected_sessions,
+        COUNT(DISTINCT CASE WHEN ar.status = 'present' THEN ats.session_id END) AS attended_sessions
+    FROM enrollments e
+    JOIN users u ON u.user_id = e.student_id
+    JOIN courses c ON c.course_id = e.course_id
+    LEFT JOIN class_schedule cs
+        ON cs.course_id = c.course_id
+       AND cs.is_active = 1
+    LEFT JOIN attendance_sessions ats
+        ON ats.schedule_id = cs.schedule_id
+       AND ats.session_date BETWEEN ? AND ?
+    LEFT JOIN attendance_records ar
+        ON ar.session_id = ats.session_id
+       AND ar.student_id = e.student_id
+    WHERE e.status = 'registered'
+";
+$params = [$dateFrom, $dateTo];
+if ($courseFilter !== 'all' && ctype_digit((string)$courseFilter)) {
+    $reportSql .= " AND c.course_id = ?";
+    $params[] = (int)$courseFilter;
+}
+if ($lecturerFilter !== 'all' && ctype_digit((string)$lecturerFilter)) {
+    $reportSql .= " AND cs.lecturer_id = ?";
+    $params[] = (int)$lecturerFilter;
+}
+$reportSql .= "
+    GROUP BY u.user_id, u.matric_no, u.full_name, c.course_id, c.course_code, c.course_name
+    ORDER BY c.course_code, u.full_name
+";
+$stmt = $pdo->prepare($reportSql);
+$stmt->execute($params);
+$reportRowsRaw = $stmt->fetchAll();
+
+$reportRows = [];
+foreach ($reportRowsRaw as $row) {
+    $expected = (int)$row['expected_sessions'];
+    $attended = (int)$row['attended_sessions'];
+    $rate = $expected > 0 ? round(($attended / $expected) * 100) : 0;
+    $status = $rate >= 80 ? 'Good' : ($rate >= 60 ? 'At Risk' : 'Warning');
+
+    if ($statusFilter !== 'all' && $status !== $statusFilter) {
+        continue;
+    }
+
+    $reportRows[] = [
+        'name' => $row['full_name'],
+        'matric' => $row['matric_no'],
+        'user_id' => (int)$row['user_id'],
+        'course_id' => (int)$row['course_id'],
+        'course' => $row['course_code'] . ' - ' . $row['course_name'],
+        'course_code' => $row['course_code'],
+        'rate' => $rate,
+        'status' => $status,
+        'expected' => $expected,
+        'attended' => $attended
+    ];
+}
+
+$totalRows = count($reportRows);
+$overallRate = $totalRows > 0 ? round(array_sum(array_column($reportRows, 'rate')) / $totalRows) : 0;
+$atRiskCount = count(array_filter($reportRows, fn($row) => $row['status'] !== 'Good'));
+$highest = $totalRows > 0 ? max(array_column($reportRows, 'rate')) : 0;
+$lowest = $totalRows > 0 ? min(array_column($reportRows, 'rate')) : 0;
+
+$chartWhere = "WHERE c.is_active = 1";
+$chartParams = [];
+if ($courseFilter !== 'all' && ctype_digit((string)$courseFilter)) {
+    $chartWhere .= " AND c.course_id = ?";
+    $chartParams[] = (int)$courseFilter;
+}
+if ($lecturerFilter !== 'all' && ctype_digit((string)$lecturerFilter)) {
+    $chartWhere .= " AND cs.lecturer_id = ?";
+    $chartParams[] = (int)$lecturerFilter;
+}
+
+$courseChartStmt = $pdo->prepare("
+    SELECT
+        c.course_code,
+        COALESCE(ROUND((SUM(ats.total_present) / NULLIF(SUM(ats.total_expected), 0)) * 100), 0) AS rate
+    FROM courses c
+    LEFT JOIN class_schedule cs ON cs.course_id = c.course_id AND cs.is_active = 1
+    LEFT JOIN attendance_sessions ats
+        ON ats.schedule_id = cs.schedule_id
+       AND ats.session_date BETWEEN ? AND ?
+    $chartWhere
+    GROUP BY c.course_id, c.course_code
+    ORDER BY c.course_code
+");
+$courseChartStmt->execute(array_merge([$dateFrom, $dateTo], $chartParams));
+$courseChartRows = $courseChartStmt->fetchAll();
+
+$trendWhere = "WHERE ats.session_date BETWEEN ? AND ?";
+$trendParams = [$dateFrom, $dateTo];
+if ($courseFilter !== 'all' && ctype_digit((string)$courseFilter)) {
+    $trendWhere .= " AND c.course_id = ?";
+    $trendParams[] = (int)$courseFilter;
+}
+if ($lecturerFilter !== 'all' && ctype_digit((string)$lecturerFilter)) {
+    $trendWhere .= " AND cs.lecturer_id = ?";
+    $trendParams[] = (int)$lecturerFilter;
+}
+
+$trendStmt = $pdo->prepare("
+    SELECT
+        CONCAT('W', WEEK(ats.session_date, 1)) AS week_label,
+        COALESCE(ROUND((SUM(ats.total_present) / NULLIF(SUM(ats.total_expected), 0)) * 100), 0) AS rate
+    FROM attendance_sessions ats
+    JOIN class_schedule cs ON cs.schedule_id = ats.schedule_id
+    JOIN courses c ON c.course_id = cs.course_id
+    $trendWhere
+    GROUP BY YEARWEEK(ats.session_date, 1), week_label
+    ORDER BY YEARWEEK(ats.session_date, 1)
+");
+$trendStmt->execute($trendParams);
+$trendRows = $trendStmt->fetchAll();
+
+$statusCounts = [
+    'Good' => count(array_filter($reportRows, fn($row) => $row['status'] === 'Good')),
+    'At Risk' => count(array_filter($reportRows, fn($row) => $row['status'] === 'At Risk')),
+    'Warning' => count(array_filter($reportRows, fn($row) => $row['status'] === 'Warning'))
+];
+
+$heatmapWhere = "WHERE ats.session_date BETWEEN ? AND ?";
+$heatmapParams = [$dateFrom, $dateTo];
+if ($courseFilter !== 'all' && ctype_digit((string)$courseFilter)) {
+    $heatmapWhere .= " AND c.course_id = ?";
+    $heatmapParams[] = (int)$courseFilter;
+}
+if ($lecturerFilter !== 'all' && ctype_digit((string)$lecturerFilter)) {
+    $heatmapWhere .= " AND cs.lecturer_id = ?";
+    $heatmapParams[] = (int)$lecturerFilter;
+}
+
+$heatmapStmt = $pdo->prepare("
+    SELECT
+        DAYNAME(ats.session_date) AS day_name,
+        COALESCE(ROUND((SUM(ats.total_present) / NULLIF(SUM(ats.total_expected), 0)) * 100), 0) AS rate
+    FROM attendance_sessions ats
+    JOIN class_schedule cs ON cs.schedule_id = ats.schedule_id
+    JOIN courses c ON c.course_id = cs.course_id
+    $heatmapWhere
+    GROUP BY DAYOFWEEK(ats.session_date), DAYNAME(ats.session_date)
+    ORDER BY DAYOFWEEK(ats.session_date)
+");
+$heatmapStmt->execute($heatmapParams);
+$heatmapRows = $heatmapStmt->fetchAll();
+
+function statusClass($status) {
+    if ($status === 'Good') return 'status-good';
+    if ($status === 'At Risk') return 'status-risk';
+    return 'status-warning';
+}
+
+function heatmapColor($rate) {
+    if ($rate >= 85) return '#2ecc71';
+    if ($rate >= 70) return '#f1c40f';
+    return '#e74c3c';
+}
+?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -117,6 +320,8 @@
             transition: var(--transition);
             text-decoration: none;
             color: inherit;
+            border: 0;
+            font: inherit;
         }
 
         .admin-profile:hover {
@@ -131,6 +336,56 @@
             border-radius: 50%;
             object-fit: cover;
             border: 2px solid var(--primary);
+        }
+
+        .admin-menu {
+            position: relative;
+        }
+
+        .profile-caret {
+            color: var(--gray);
+            font-size: 0.8rem;
+        }
+
+        .admin-dropdown {
+            position: absolute;
+            right: 0;
+            top: calc(100% + 10px);
+            min-width: 180px;
+            padding: 8px;
+            border-radius: 14px;
+            background: white;
+            box-shadow: 0 18px 40px rgba(15, 23, 42, 0.16);
+            border: 1px solid rgba(67, 97, 238, 0.12);
+            opacity: 0;
+            visibility: hidden;
+            transform: translateY(-6px);
+            transition: var(--transition);
+            z-index: 20;
+        }
+
+        .admin-menu:hover .admin-dropdown,
+        .admin-menu:focus-within .admin-dropdown {
+            opacity: 1;
+            visibility: visible;
+            transform: translateY(0);
+        }
+
+        .admin-dropdown a {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 11px 12px;
+            border-radius: 10px;
+            color: var(--dark);
+            text-decoration: none;
+            font-weight: 600;
+            transition: var(--transition);
+        }
+
+        .admin-dropdown a:hover {
+            background: linear-gradient(135deg, rgba(6, 120, 88, 0.08), rgba(67, 97, 238, 0.08));
+            color: var(--primary);
         }
 
         /* SIDEBAR */
@@ -308,14 +563,16 @@
 
         .filter-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1.5rem;
+            grid-template-columns: minmax(190px, 0.9fr) minmax(230px, 1.15fr) minmax(330px, 1.35fr) minmax(180px, 0.8fr);
+            gap: 1.25rem;
             margin-bottom: 1.5rem;
+            align-items: end;
         }
 
         .filter-group {
             display: flex;
             flex-direction: column;
+            min-width: 0;
         }
 
         .filter-label {
@@ -325,6 +582,8 @@
         }
 
         .filter-select {
+            width: 100%;
+            min-width: 0;
             padding: 12px 16px;
             border: 1px solid #ddd;
             border-radius: 8px;
@@ -344,10 +603,17 @@
             display: flex;
             gap: 0.5rem;
             align-items: center;
+            min-width: 0;
+        }
+
+        .date-inputs .filter-select {
+            flex: 1 1 0;
+            min-width: 0;
         }
 
         .date-inputs span {
             color: var(--gray);
+            flex: 0 0 auto;
         }
 
         .filter-actions {
@@ -356,6 +622,10 @@
             gap: 1rem;
             padding-top: 1rem;
             border-top: 1px solid #eee;
+        }
+
+        #statusFilter {
+            max-width: 190px;
         }
 
         /* STATS CARDS */
@@ -804,6 +1074,18 @@
             .charts-section {
                 grid-template-columns: 1fr;
             }
+
+            .filter-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+
+            .filter-group:nth-child(3) {
+                grid-column: auto;
+            }
+
+            #statusFilter {
+                max-width: none;
+            }
         }
 
         @media (max-width: 992px) {
@@ -819,9 +1101,6 @@
                 grid-template-columns: repeat(2, 1fr);
             }
             
-            .filter-grid {
-                grid-template-columns: repeat(2, 1fr);
-            }
         }
 
         @media (max-width: 768px) {
@@ -831,6 +1110,10 @@
             
             .filter-grid {
                 grid-template-columns: 1fr;
+            }
+
+            .filter-group:nth-child(3) {
+                grid-column: auto;
             }
             
             .page-header {
@@ -885,12 +1168,13 @@
             }
         }
     </style>
+    <link rel="stylesheet" href="../assets/css/app-polish.css">
 </head>
 <body>
     <div class="dashboard-container">
         <!-- HEADER -->
         <div class="header">
-            <a href="#" class="logo">
+            <a href="dashboard.php" class="logo">
                 <i class="fas fa-id-card"></i>
                 <div>
                     <h1>RFID IoT Attendance</h1>
@@ -898,14 +1182,17 @@
                 </div>
             </a>
             <div class="header-right">
-                <div class="status-badge">
-                    <i class="fas fa-circle"></i>
-                    <span>System Online</span>
+                <div class="admin-menu">
+                    <button type="button" class="admin-profile">
+                        <img src="https://ui-avatars.com/api/?name=Admin+User&background=4361ee&color=fff" alt="Admin">
+                        <div style="font-weight: 600;">Admin</div>
+                        <i class="fas fa-chevron-down profile-caret"></i>
+                    </button>
+                    <div class="admin-dropdown">
+                        <a href="../admin/settings.php"><i class="fas fa-cog"></i> Settings</a>
+                        <a href="../logout.php"><i class="fas fa-sign-out-alt"></i> Logout</a>
+                    </div>
                 </div>
-                <a href="#" class="admin-profile">
-                    <img src="https://ui-avatars.com/api/?name=Admin+User&background=4361ee&color=fff" alt="Admin">
-                    <span>Admin User</span>
-                </a>
             </div>
         </div>
 
@@ -917,23 +1204,15 @@
                     <li><a href="dashboard.php" class="nav-item"><i class="fas fa-chart-line"></i> Admin Dashboard</a></li>
                     <li><a href="users.php" class="nav-item"><i class="fas fa-users"></i> Users & RFID</a></li>
                     <li><a href="courses.php" class="nav-item"><i class="fas fa-calendar-alt"></i> Courses & Timetable</a></li>
+                </ul>
+            </div>
+
+            <div class="sidebar-section">
+                <h3>Reports</h3>
+                <ul class="nav-menu">
                     <li><a href="reports.php" class="nav-item active"><i class="fas fa-chart-bar"></i> Reports & Analytics</a></li>
                 </ul>
             </div>
-            
-            <div class="sidebar-section">
-                <h3>System</h3>
-                <ul class="nav-menu">
-                    <li><a href="#" class="nav-item"><i class="fas fa-cog"></i> Settings</a></li>
-                    <li><a href="#" class="nav-item"><i class="fas fa-bell"></i> Notifications</a></li>
-                    <li><a href="#" class="nav-item"><i class="fas fa-shield-alt"></i> Security</a></li>
-                </ul>
-            </div>
-            
-            <button class="logout-btn" onclick="window.location.href='../logout.php'">
-                <i class="fas fa-sign-out-alt"></i>
-                Logout
-            </button>
         </div>
 
         <!-- MAIN CONTENT -->
@@ -951,9 +1230,6 @@
                     <button class="btn btn-primary" onclick="showExportModal()">
                         <i class="fas fa-download"></i> Export
                     </button>
-                    <button class="btn btn-info" onclick="showNotifyModal()">
-                        <i class="fas fa-bell"></i> Notify At Risk
-                    </button>
                 </div>
             </div>
 
@@ -961,37 +1237,42 @@
             <div class="filter-bar">
                 <div class="filter-grid">
                     <div class="filter-group">
-                        <label class="filter-label">Semester</label>
-                        <select class="filter-select" id="semesterFilter">
-                            <option>Current Semester</option>
-                            <option>Previous Semester</option>
-                            <option>All Semesters</option>
+                        <label class="filter-label">Lecturer</label>
+                        <select class="filter-select" id="lecturerFilter">
+                            <option value="all">All Lecturers</option>
+                            <?php foreach ($lecturers as $lecturer): ?>
+                                <option value="<?= htmlspecialchars($lecturer['user_id']) ?>" <?= (string)$lecturerFilter === (string)$lecturer['user_id'] ? 'selected' : '' ?>>
+                                    <?= htmlspecialchars($lecturer['full_name']) ?>
+                                </option>
+                            <?php endforeach; ?>
                         </select>
                     </div>
                     <div class="filter-group">
                         <label class="filter-label">Course</label>
                         <select class="filter-select" id="courseFilter">
-                            <option>All Courses</option>
-                            <option>BIC20403 - Software Engineering</option>
-                            <option>BIT10102 - Introduction to Programming</option>
-                            <option>BIT31405 - Database Systems</option>
+                            <option value="all">All Courses</option>
+                            <?php foreach ($courses as $course): ?>
+                                <option value="<?= htmlspecialchars($course['course_id']) ?>" <?= (string)$courseFilter === (string)$course['course_id'] ? 'selected' : '' ?>>
+                                    <?= htmlspecialchars($course['course_code'] . ' - ' . $course['course_name']) ?>
+                                </option>
+                            <?php endforeach; ?>
                         </select>
                     </div>
                     <div class="filter-group">
                         <label class="filter-label">Date Range</label>
                         <div class="date-inputs">
-                            <input type="date" class="filter-select">
+                            <input type="date" class="filter-select" id="dateFrom" value="<?= htmlspecialchars($dateFrom) ?>">
                             <span>to</span>
-                            <input type="date" class="filter-select">
+                            <input type="date" class="filter-select" id="dateTo" value="<?= htmlspecialchars($dateTo) ?>">
                         </div>
                     </div>
                     <div class="filter-group">
                         <label class="filter-label">Status</label>
                         <select class="filter-select" id="statusFilter">
-                            <option>All Status</option>
+                            <option value="all">All Status</option>
                             <option>Good (≥80%)</option>
-                            <option>At Risk (60-79%)</option>
-                            <option>Warning (<60%)</option>
+                            <option value="At Risk">At Risk (60-79%)</option>
+                            <option value="Warning">Warning (&lt;60%)</option>
                         </select>
                     </div>
                 </div>
@@ -1012,7 +1293,7 @@
                         <i class="fas fa-clipboard-check"></i>
                     </div>
                     <div class="stat-content">
-                        <h3>85%</h3>
+                        <h3><?= $overallRate ?>%</h3>
                         <p>Total Attendance Rate</p>
                     </div>
                 </div>
@@ -1021,7 +1302,7 @@
                         <i class="fas fa-exclamation-triangle"></i>
                     </div>
                     <div class="stat-content">
-                        <h3>4</h3>
+                        <h3><?= $atRiskCount ?></h3>
                         <p>Students At Risk</p>
                     </div>
                 </div>
@@ -1030,8 +1311,8 @@
                         <i class="fas fa-trophy"></i>
                     </div>
                     <div class="stat-content">
-                        <h3>92%</h3>
-                        <p>Highest Course (BIC20403)</p>
+                        <h3><?= $highest ?>%</h3>
+                        <p>Highest Student Rate</p>
                     </div>
                 </div>
                 <div class="stat-card">
@@ -1039,8 +1320,8 @@
                         <i class="fas fa-chart-line-down"></i>
                     </div>
                     <div class="stat-content">
-                        <h3>55%</h3>
-                        <p>Lowest Course (BIT10102)</p>
+                        <h3><?= $lowest ?>%</h3>
+                        <p>Lowest Student Rate</p>
                     </div>
                 </div>
             </div>
@@ -1050,10 +1331,7 @@
                 <div class="chart-card">
                     <div class="chart-header">
                         <div class="chart-title">Attendance by Course</div>
-                        <select class="filter-select" style="width: auto;">
-                            <option>This Semester</option>
-                            <option>Last Semester</option>
-                        </select>
+                        <span style="color: var(--gray); font-size: 0.9rem;">Based on selected filters</span>
                     </div>
                     <div class="chart-container">
                         <canvas id="courseChart"></canvas>
@@ -1063,10 +1341,7 @@
                 <div class="chart-card">
                     <div class="chart-header">
                         <div class="chart-title">Weekly Attendance Trend</div>
-                        <select class="filter-select" style="width: auto;">
-                            <option>All Courses</option>
-                            <option>BIC20403</option>
-                        </select>
+                        <span style="color: var(--gray); font-size: 0.9rem;">By selected lecturer/course</span>
                     </div>
                     <div class="chart-container">
                         <canvas id="trendChart"></canvas>
@@ -1076,10 +1351,7 @@
                 <div class="chart-card">
                     <div class="chart-header">
                         <div class="chart-title">Student Status Distribution</div>
-                        <select class="filter-select" style="width: auto;">
-                            <option>All Courses</option>
-                            <option>By Course</option>
-                        </select>
+                        <span style="color: var(--gray); font-size: 0.9rem;">Current table results</span>
                     </div>
                     <div class="chart-container">
                         <canvas id="statusChart"></canvas>
@@ -1088,19 +1360,21 @@
                 
                 <div class="heatmap-card">
                     <div class="chart-header">
-                        <div class="chart-title">Attendance Heatmap (This Week)</div>
+                        <div class="chart-title">Attendance Heatmap</div>
                         <button class="btn btn-outline" style="padding: 6px 12px;">
                             <i class="fas fa-expand"></i>
                         </button>
                     </div>
                     <div class="heatmap-grid">
-                        <div class="heatmap-cell" style="background: #2ecc71;">92%</div>
-                        <div class="heatmap-cell" style="background: #27ae60;">88%</div>
-                        <div class="heatmap-cell" style="background: #f1c40f;">78%</div>
-                        <div class="heatmap-cell" style="background: #f1c40f;">75%</div>
-                        <div class="heatmap-cell" style="background: #f39c12;">68%</div>
-                        <div class="heatmap-cell" style="background: #e67e22;">62%</div>
-                        <div class="heatmap-cell" style="background: #e74c3c;">55%</div>
+                        <?php if (empty($heatmapRows)): ?>
+                            <div style="grid-column: 1 / -1; color: var(--gray); text-align: center; padding: 1rem;">No sessions this week</div>
+                        <?php else: ?>
+                            <?php foreach ($heatmapRows as $heatmap): ?>
+                                <div class="heatmap-cell" style="background: <?= heatmapColor((int)$heatmap['rate']) ?>;" title="<?= htmlspecialchars($heatmap['day_name']) ?>">
+                                    <?= (int)$heatmap['rate'] ?>%
+                                </div>
+                            <?php endforeach; ?>
+                        <?php endif; ?>
                     </div>
                     <div class="heatmap-legend">
                         <div class="legend-item">
@@ -1124,16 +1398,13 @@
                 <div class="table-header">
                     <div class="table-title">Attendance Details</div>
                     <div class="action-buttons">
-                        <button class="btn btn-success">
-                            <i class="fas fa-plus"></i> Add Schedule
-                        </button>
                     </div>
                 </div>
                 <div style="overflow-x: auto;">
                     <table>
                         <thead>
                             <tr>
-                                <th>Student/Lecturer Name</th>
+                                <th>Student Name</th>
                                 <th>Course</th>
                                 <th>Attendance %</th>
                                 <th>Status</th>
@@ -1141,118 +1412,32 @@
                             </tr>
                         </thead>
                         <tbody>
-                            <tr>
-                                <td>Nur Alya Nadhirah</td>
-                                <td>BIC20403 - Software Engineering</td>
-                                <td class="attendance-percent">92%</td>
-                                <td><span class="status-badge-table status-good">Good</span></td>
-                                <td>
-                                    <div class="action-buttons-cell">
-                                        <button class="btn-action btn-edit" onclick="editRecord('Nur Alya Nadhirah')">
-                                            <i class="fas fa-edit"></i> Edit
-                                        </button>
-                                        <button class="btn-action btn-view" onclick="viewDetails('Nur Alya Nadhirah')">
-                                            <i class="fas fa-eye"></i> View
-                                        </button>
-                                    </div>
-                                </td>
-                            </tr>
-                            <tr>
-                                <td>Adam</td>
-                                <td>BIC20403 - Software Engineering</td>
-                                <td class="attendance-percent">80%</td>
-                                <td><span class="status-badge-table status-risk">At Risk</span></td>
-                                <td>
-                                    <div class="action-buttons-cell">
-                                        <button class="btn-action btn-edit" onclick="editRecord('Adam')">
-                                            <i class="fas fa-edit"></i> Edit
-                                        </button>
-                                        <button class="btn-action btn-notify" onclick="notifyStudent('Adam')">
-                                            <i class="fas fa-bell"></i> Notify
-                                        </button>
-                                    </div>
-                                </td>
-                            </tr>
-                            <tr>
-                                <td>Aina</td>
-                                <td>BIC20403 - Software Engineering</td>
-                                <td class="attendance-percent">60%</td>
-                                <td><span class="status-badge-table status-risk">At Risk</span></td>
-                                <td>
-                                    <div class="action-buttons-cell">
-                                        <button class="btn-action btn-edit" onclick="editRecord('Aina')">
-                                            <i class="fas fa-edit"></i> Edit
-                                        </button>
-                                        <button class="btn-action btn-notify" onclick="notifyStudent('Aina')">
-                                            <i class="fas fa-bell"></i> Notify
-                                        </button>
-                                    </div>
-                                </td>
-                            </tr>
-                            <tr>
-                                <td>Syafiq</td>
-                                <td>BIC20403 - Software Engineering</td>
-                                <td class="attendance-percent">60%</td>
-                                <td><span class="status-badge-table status-risk">At Risk</span></td>
-                                <td>
-                                    <div class="action-buttons-cell">
-                                        <button class="btn-action btn-edit" onclick="editRecord('Syafiq')">
-                                            <i class="fas fa-edit"></i> Edit
-                                        </button>
-                                        <button class="btn-action btn-notify" onclick="notifyStudent('Syafiq')">
-                                            <i class="fas fa-bell"></i> Notify
-                                        </button>
-                                    </div>
-                                </td>
-                            </tr>
-                            <tr>
-                                <td>Farah</td>
-                                <td>BIT10102 - Introduction to Programming</td>
-                                <td class="attendance-percent">55%</td>
-                                <td><span class="status-badge-table status-warning">Warning</span></td>
-                                <td>
-                                    <div class="action-buttons-cell">
-                                        <button class="btn-action btn-edit" onclick="editRecord('Farah')">
-                                            <i class="fas fa-edit"></i> Edit
-                                        </button>
-                                        <button class="btn-action btn-notify" onclick="notifyStudent('Farah')">
-                                            <i class="fas fa-bell"></i> Notify
-                                        </button>
-                                    </div>
-                                </td>
-                            </tr>
-                            <tr>
-                                <td>Dr. Nurul Aswa</td>
-                                <td>BIC20403 - Software Engineering</td>
-                                <td class="attendance-percent">97%</td>
-                                <td><span class="status-badge-table status-good">Good</span></td>
-                                <td>
-                                    <div class="action-buttons-cell">
-                                        <button class="btn-action btn-edit" onclick="editRecord('Dr. Nurul Aswa')">
-                                            <i class="fas fa-edit"></i> Edit
-                                        </button>
-                                        <button class="btn-action btn-view" onclick="viewDetails('Dr. Nurul Aswa')">
-                                            <i class="fas fa-eye"></i> View
-                                        </button>
-                                    </div>
-                                </td>
-                            </tr>
-                            <tr>
-                                <td>Mr. Adam</td>
-                                <td>BIT31405 - Database Systems</td>
-                                <td class="attendance-percent">78%</td>
-                                <td><span class="status-badge-table status-good">Good</span></td>
-                                <td>
-                                    <div class="action-buttons-cell">
-                                        <button class="btn-action btn-edit" onclick="editRecord('Mr. Adam')">
-                                            <i class="fas fa-edit"></i> Edit
-                                        </button>
-                                        <button class="btn-action btn-view" onclick="viewDetails('Mr. Adam')">
-                                            <i class="fas fa-eye"></i> View
-                                        </button>
-                                    </div>
-                                </td>
-                            </tr>
+                            <?php if (empty($reportRows)): ?>
+                                <tr>
+                                    <td colspan="5" style="text-align: center; color: var(--gray); padding: 2rem;">
+                                        No enrollment or attendance data found.
+                                    </td>
+                                </tr>
+                            <?php else: ?>
+                                <?php foreach ($reportRows as $row): ?>
+                                    <tr>
+                                        <td>
+                                            <?= htmlspecialchars($row['name']) ?><br>
+                                            <span style="color: var(--gray); font-size: 0.85rem;"><?= htmlspecialchars($row['matric']) ?></span>
+                                        </td>
+                                        <td><?= htmlspecialchars($row['course']) ?></td>
+                                        <td class="attendance-percent"><?= $row['rate'] ?>%</td>
+                                        <td><span class="status-badge-table <?= statusClass($row['status']) ?>"><?= htmlspecialchars($row['status']) ?></span></td>
+                                        <td>
+                                            <div class="action-buttons-cell">
+                                                <button class="btn-action btn-view" onclick="viewDetails(<?= (int)$row['user_id'] ?>, <?= (int)$row['course_id'] ?>)">
+                                                    <i class="fas fa-eye"></i> View
+                                                </button>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
                         </tbody>
                     </table>
                 </div>
@@ -1260,7 +1445,7 @@
 
             <!-- FOOTER -->
             <div class="footer">
-                <p>RFID IoT Attendance System &copy; 2024 | Current Semester: Semester 3, 2024 | Week 12 of 14</p>
+                <p>RFID IoT Attendance System &copy; 2026 | Nur Alya Nadhirah binti Naaidith | DI230078</p>
                 <p>Last Updated: <span id="currentDateTime"></span></p>
             </div>
         </div>
@@ -1274,41 +1459,22 @@
                 <button class="modal-close" onclick="closeExportModal()">&times;</button>
             </div>
             <div class="modal-body">
-                <div class="export-options">
-                    <div class="export-option" onclick="exportAs('CSV')">
-                        <div class="export-icon icon-csv">
-                            <i class="fas fa-file-csv"></i>
-                        </div>
-                        <div>
-                            <h4>Export as CSV</h4>
-                            <p>Comma-separated values for spreadsheet software</p>
-                        </div>
-                    </div>
-                    <div class="export-option" onclick="exportAs('PDF')">
-                        <div class="export-icon icon-pdf">
-                            <i class="fas fa-file-pdf"></i>
-                        </div>
-                        <div>
-                            <h4>Export as PDF</h4>
-                            <p>Portable Document Format for printing and sharing</p>
-                        </div>
-                    </div>
-                    <div class="export-option" onclick="exportAs('Excel')">
-                        <div class="export-icon icon-excel">
-                            <i class="fas fa-file-excel"></i>
-                        </div>
-                        <div>
-                            <h4>Export as Excel</h4>
-                            <p>Microsoft Excel format with formatting</p>
-                        </div>
+                <div class="form-group">
+                    <label class="form-label">Format</label>
+                    <select class="form-control" id="reportExportFormat">
+                        <option value="pdf">PDF Print View</option>
+                        <option value="csv">CSV / Excel</option>
+                    </select>
+                    <div style="color: var(--gray); font-size: 0.9rem; margin-top: 0.5rem;">
+                        PDF Print View opens a neat report page. Use Print then Save as PDF.
                     </div>
                 </div>
                 <div class="form-group">
                     <label class="form-label">Date Range for Export</label>
                     <div class="date-inputs">
-                        <input type="date" class="form-control">
+                        <input type="date" class="form-control" id="exportDateFrom" value="<?= htmlspecialchars($dateFrom) ?>">
                         <span>to</span>
-                        <input type="date" class="form-control">
+                        <input type="date" class="form-control" id="exportDateTo" value="<?= htmlspecialchars($dateTo) ?>">
                     </div>
                 </div>
             </div>
@@ -1319,72 +1485,37 @@
         </div>
     </div>
 
-    <!-- NOTIFY MODAL -->
-    <div class="modal" id="notifyModal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <div class="modal-title">Notify At Risk Students</div>
-                <button class="modal-close" onclick="closeNotifyModal()">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div class="form-group">
-                    <label class="form-label">Message Template</label>
-                    <select class="form-control">
-                        <option>Low Attendance Warning</option>
-                        <option>Attendance Improvement Required</option>
-                        <option>Meeting Request</option>
-                        <option>Custom Message</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label class="form-label">Custom Message</label>
-                    <textarea class="form-control" rows="4" placeholder="Enter your custom notification message here..."></textarea>
-                </div>
-                <div class="form-group">
-                    <label class="form-label">Send Via</label>
-                    <div style="display: flex; gap: 1rem; margin-top: 0.5rem;">
-                        <label style="display: flex; align-items: center; gap: 0.5rem;">
-                            <input type="checkbox" checked> Email
-                        </label>
-                        <label style="display: flex; align-items: center; gap: 0.5rem;">
-                            <input type="checkbox"> SMS
-                        </label>
-                        <label style="display: flex; align-items: center; gap: 0.5rem;">
-                            <input type="checkbox" checked> System Notification
-                        </label>
-                    </div>
-                </div>
-            </div>
-            <div class="modal-footer">
-                <button class="btn btn-outline" onclick="closeNotifyModal()">Cancel</button>
-                <button class="btn btn-primary" onclick="sendNotifications()">Send Notifications</button>
-            </div>
-        </div>
-    </div>
-
     <script>
+        const reportRows = <?= json_encode($reportRows, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
+        const courseChartRows = <?= json_encode($courseChartRows, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
+        const trendRows = <?= json_encode($trendRows, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
+        const statusCounts = <?= json_encode($statusCounts, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
+        const selectedStatusFilter = <?= json_encode($statusFilter) ?>;
+
         // Initialize Charts
         document.addEventListener('DOMContentLoaded', function() {
             // Update current date and time
             updateDateTime();
             setInterval(updateDateTime, 60000); // Update every minute
+            if (selectedStatusFilter !== 'all') {
+                const statusFilter = document.getElementById('statusFilter');
+                [...statusFilter.options].forEach(option => {
+                    if (option.value === selectedStatusFilter || option.textContent.includes(selectedStatusFilter)) {
+                        option.selected = true;
+                    }
+                });
+            }
 
             // Course Attendance Bar Chart
             const courseCtx = document.getElementById('courseChart').getContext('2d');
             new Chart(courseCtx, {
                 type: 'bar',
                 data: {
-                    labels: ['BIC20403', 'BIT10102', 'BIT31405', 'BIT20304', 'BIT40506'],
+                    labels: courseChartRows.map(row => row.course_code),
                     datasets: [{
                         label: 'Attendance %',
-                        data: [92, 55, 78, 85, 88],
-                        backgroundColor: [
-                            '#4361ee',
-                            '#e74c3c',
-                            '#3498db',
-                            '#f39c12',
-                            '#9b59b6'
-                        ],
+                        data: courseChartRows.map(row => Number(row.rate || 0)),
+                        backgroundColor: '#4361ee',
                         borderWidth: 0,
                         borderRadius: 6
                     }]
@@ -1414,20 +1545,12 @@
             new Chart(trendCtx, {
                 type: 'line',
                 data: {
-                    labels: ['W1', 'W2', 'W3', 'W4', 'W5', 'W6', 'W7', 'W8', 'W9', 'W10', 'W11', 'W12'],
+                    labels: trendRows.map(row => row.week_label),
                     datasets: [{
-                        label: 'BIC20403',
-                        data: [85, 88, 90, 87, 92, 91, 93, 92, 90, 92, 91, 92],
+                        label: 'Attendance %',
+                        data: trendRows.map(row => Number(row.rate || 0)),
                         borderColor: '#4361ee',
                         backgroundColor: 'rgba(67, 97, 238, 0.1)',
-                        borderWidth: 3,
-                        fill: true,
-                        tension: 0.3
-                    }, {
-                        label: 'BIT10102',
-                        data: [70, 65, 68, 60, 58, 55, 53, 52, 55, 54, 56, 55],
-                        borderColor: '#e74c3c',
-                        backgroundColor: 'rgba(231, 76, 60, 0.1)',
                         borderWidth: 3,
                         fill: true,
                         tension: 0.3
@@ -1458,7 +1581,7 @@
                 data: {
                     labels: ['Good', 'At Risk', 'Warning'],
                     datasets: [{
-                        data: [65, 30, 5],
+                        data: [statusCounts.Good || 0, statusCounts['At Risk'] || 0, statusCounts.Warning || 0],
                         backgroundColor: ['#2ecc71', '#f39c12', '#e74c3c'],
                         borderWidth: 0,
                         hoverOffset: 15
@@ -1496,44 +1619,41 @@
             document.getElementById('exportModal').style.display = 'none';
         }
 
-        function showNotifyModal() {
-            document.getElementById('notifyModal').style.display = 'flex';
-        }
-
-        function closeNotifyModal() {
-            document.getElementById('notifyModal').style.display = 'none';
-        }
-
-        // Export function
-        function exportAs(format) {
-            showToast(`Exporting as ${format}...`, 'info');
-            // Simulate export delay
-            setTimeout(() => {
-                showToast(`Report exported successfully as ${format}`, 'success');
-                closeExportModal();
-            }, 1500);
-        }
-
         function startExport() {
-            showToast('Export process started...', 'info');
+            const params = new URLSearchParams();
+            params.set('type', 'attendance');
+            params.set('format', document.getElementById('reportExportFormat').value || 'pdf');
+            params.set('from', document.getElementById('exportDateFrom').value || document.getElementById('dateFrom').value || '');
+            params.set('to', document.getElementById('exportDateTo').value || document.getElementById('dateTo').value || '');
             closeExportModal();
-        }
-
-        function sendNotifications() {
-            showToast('Notifications sent to at-risk students', 'success');
-            closeNotifyModal();
+            window.location.href = `export_dashboard_report.php?${params.toString()}`;
         }
 
         // Filter functions
         function applyFilters() {
-            showToast('Filters applied successfully', 'success');
+            const params = new URLSearchParams();
+            params.set('lecturer_id', document.getElementById('lecturerFilter').value || 'all');
+            params.set('course_id', document.getElementById('courseFilter').value || 'all');
+            params.set('date_from', document.getElementById('dateFrom').value || '');
+            params.set('date_to', document.getElementById('dateTo').value || '');
+            const statusText = document.getElementById('statusFilter').value;
+            if (statusText.includes('Good')) {
+                params.set('status', 'Good');
+            } else if (statusText.includes('At Risk')) {
+                params.set('status', 'At Risk');
+            } else if (statusText.includes('Warning')) {
+                params.set('status', 'Warning');
+            } else {
+                params.set('status', 'all');
+            }
+            window.location.href = `reports.php?${params.toString()}`;
         }
 
         function clearFilters() {
-            document.getElementById('semesterFilter').value = 'Current Semester';
-            document.getElementById('courseFilter').value = 'All Courses';
-            document.getElementById('statusFilter').value = 'All Status';
-            showToast('Filters cleared', 'info');
+            document.getElementById('lecturerFilter').value = 'all';
+            document.getElementById('courseFilter').value = 'all';
+            document.getElementById('statusFilter').value = 'all';
+            window.location.href = 'reports.php';
         }
 
         // Record functions
@@ -1541,12 +1661,13 @@
             showToast(`Editing record for ${name}`, 'info');
         }
 
-        function viewDetails(name) {
-            showToast(`Viewing details for ${name}`, 'info');
-        }
-
-        function notifyStudent(name) {
-            showToast(`Notification sent to ${name}`, 'success');
+        function viewDetails(studentId, courseId) {
+            const params = new URLSearchParams();
+            params.set('student_id', studentId);
+            params.set('course_id', courseId);
+            params.set('date_from', document.getElementById('dateFrom').value || '');
+            params.set('date_to', document.getElementById('dateTo').value || '');
+            window.location.href = `report_student_detail.php?${params.toString()}`;
         }
 
         function showPrintOptions() {

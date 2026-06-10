@@ -1,3 +1,287 @@
+<?php
+require_once '../includes/auth_check.php';
+requireAdmin();
+require_once '../includes/config.php';
+
+function countRows($pdo, $sql) {
+    try {
+        return (int) $pdo->query($sql)->fetchColumn();
+    } catch (Exception $e) {
+        return 0;
+    }
+}
+
+function adminDashboardJsonResponse($ok, $message, $extra = []) {
+    header('Content-Type: application/json');
+    echo json_encode(array_merge([
+        'ok' => $ok,
+        'message' => $message
+    ], $extra));
+    exit();
+}
+
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
+    $action = $_POST['action'] ?? '';
+
+    try {
+        if ($action === 'add_student') {
+            $studentId = strtoupper(trim($_POST['student_id'] ?? ''));
+            $studentName = trim($_POST['student_name'] ?? '');
+            $email = trim($_POST['email'] ?? '');
+            $phone = trim($_POST['phone'] ?? '');
+            $department = trim($_POST['department'] ?? '');
+            $semester = trim($_POST['semester'] ?? '');
+
+            if ($studentId === '' || $studentName === '' || $email === '') {
+                adminDashboardJsonResponse(false, 'Please fill in student ID, name and email.');
+            }
+
+            $stmt = $pdo->prepare("
+                INSERT INTO users
+                    (matric_no, full_name, email, phone, password_hash, role, department, faculty, is_active)
+                VALUES
+                    (?, ?, ?, ?, ?, 'student', ?, 'OTHER', 1)
+            ");
+            $stmt->execute([
+                $studentId,
+                $studentName,
+                $email,
+                $phone,
+                password_hash('password123', PASSWORD_DEFAULT),
+                trim($department . ($semester !== '' ? ' Semester ' . $semester : ''))
+            ]);
+
+            adminDashboardJsonResponse(true, 'Student added successfully.', [
+                'user_id' => $pdo->lastInsertId()
+            ]);
+        }
+
+        if ($action === 'register_rfid') {
+            $userId = (int)($_POST['user_id'] ?? 0);
+            $uid = strtoupper(trim($_POST['uid'] ?? ''));
+            $cardType = trim($_POST['card_type'] ?? 'student');
+            $status = ($_POST['activate_now'] ?? '1') === '1' ? 'active' : 'inactive';
+
+            if ($userId <= 0 || $uid === '') {
+                adminDashboardJsonResponse(false, 'Please select a student and enter RFID UID.');
+            }
+
+            if (!in_array($cardType, ['student', 'lecturer', 'staff'], true)) {
+                $cardType = 'student';
+            }
+
+            $userStmt = $pdo->prepare("SELECT user_id FROM users WHERE user_id = ? LIMIT 1");
+            $userStmt->execute([$userId]);
+            if (!$userStmt->fetch()) {
+                adminDashboardJsonResponse(false, 'Selected user was not found.');
+            }
+
+            $cardId = 'CARD' . date('YmdHis') . random_int(10, 99);
+            $stmt = $pdo->prepare("
+                INSERT INTO rfid_cards
+                    (card_id, user_id, uid, card_type, issue_date, status, registered_by)
+                VALUES
+                    (?, ?, ?, ?, CURDATE(), ?, ?)
+            ");
+            $stmt->execute([$cardId, $userId, $uid, $cardType, $status, $_SESSION['user_id']]);
+
+            adminDashboardJsonResponse(true, 'RFID card registered successfully.');
+        }
+
+        if ($action === 'save_timetable') {
+            $courseId = (int)($_POST['course_id'] ?? 0);
+            $day = trim($_POST['day'] ?? 'monday');
+            $startTime = trim($_POST['start_time'] ?? '');
+            $duration = max(1, min(4, (int)($_POST['duration'] ?? 2)));
+            $roomCode = trim($_POST['room'] ?? '');
+
+            $dayMap = [
+                'monday' => 'Monday',
+                'tuesday' => 'Tuesday',
+                'wednesday' => 'Wednesday',
+                'thursday' => 'Thursday',
+                'friday' => 'Friday',
+                'saturday' => 'Saturday'
+            ];
+
+            if ($courseId <= 0 || $startTime === '' || $roomCode === '') {
+                adminDashboardJsonResponse(false, 'Please select course, time and room.');
+            }
+
+            if (!isset($dayMap[$day])) {
+                adminDashboardJsonResponse(false, 'Invalid timetable day.');
+            }
+
+            $lecturerStmt = $pdo->query("SELECT user_id FROM users WHERE role = 'lecturer' AND is_active = 1 ORDER BY user_id LIMIT 1");
+            $lecturer = $lecturerStmt->fetch();
+            if (!$lecturer) {
+                adminDashboardJsonResponse(false, 'Please add at least one lecturer before creating a timetable.');
+            }
+
+            $roomStmt = $pdo->prepare("SELECT room_id FROM rooms WHERE room_code = ? OR room_name = ? LIMIT 1");
+            $roomStmt->execute([$roomCode, $roomCode]);
+            $room = $roomStmt->fetch();
+            if (!$room) {
+                adminDashboardJsonResponse(false, 'Room not found. Please use an existing room code.');
+            }
+
+            $endTime = date('H:i:s', strtotime($startTime . ' +' . $duration . ' hours'));
+            $stmt = $pdo->prepare("
+                INSERT INTO class_schedule
+                    (course_id, lecturer_id, room_id, day_of_week, start_time, end_time, repeat_weekly, start_date, end_date, is_active)
+                VALUES
+                    (?, ?, ?, ?, ?, ?, 1, CURDATE(), DATE_ADD(CURDATE(), INTERVAL 6 MONTH), 1)
+            ");
+            $stmt->execute([$courseId, $lecturer['user_id'], $room['room_id'], $dayMap[$day], $startTime, $endTime]);
+
+            adminDashboardJsonResponse(true, 'Timetable saved successfully.');
+        }
+
+        adminDashboardJsonResponse(false, 'Unknown action.');
+    } catch (PDOException $e) {
+        if ($e->getCode() === '23000') {
+            adminDashboardJsonResponse(false, 'Duplicate data found. Please check ID, email, RFID UID or schedule.');
+        }
+        adminDashboardJsonResponse(false, 'Database error: ' . $e->getMessage());
+    }
+}
+
+$totalStudents = countRows($pdo, "SELECT COUNT(*) FROM users WHERE role = 'student'");
+$totalLecturers = countRows($pdo, "SELECT COUNT(*) FROM users WHERE role = 'lecturer'");
+$totalCourses = countRows($pdo, "SELECT COUNT(*) FROM courses");
+$activeCards = countRows($pdo, "SELECT COUNT(*) FROM rfid_cards WHERE status = 'active'");
+
+$presentCount = countRows($pdo, "
+    SELECT COUNT(*)
+    FROM attendance_records ar
+    JOIN attendance_sessions ats ON ats.session_id = ar.session_id
+    WHERE ats.session_date = CURDATE() AND ar.status = 'present'
+");
+$absentCount = countRows($pdo, "
+    SELECT COUNT(*)
+    FROM attendance_records ar
+    JOIN attendance_sessions ats ON ats.session_id = ar.session_id
+    WHERE ats.session_date = CURDATE() AND ar.status = 'absent'
+");
+
+$todayAttendance = $presentCount + $absentCount;
+$totalToday = max($todayAttendance, 1);
+$attendanceRate = round(($presentCount / $totalToday) * 100, 1);
+
+$loggedToday = countRows($pdo, "
+    SELECT COUNT(DISTINCT ar.student_id)
+    FROM attendance_records ar
+    JOIN attendance_sessions ats ON ats.session_id = ar.session_id
+    WHERE ats.session_date = CURDATE()
+");
+$totalSchedules = countRows($pdo, "SELECT COUNT(*) FROM class_schedule");
+
+$studentOptions = $pdo->query("
+    SELECT user_id, matric_no, full_name
+    FROM users
+    WHERE role = 'student' AND is_active = 1
+    ORDER BY full_name
+")->fetchAll();
+
+$courseOptions = $pdo->query("
+    SELECT course_id, course_code, course_name
+    FROM courses
+    WHERE is_active = 1
+    ORDER BY course_code
+")->fetchAll();
+
+$recentLogsStmt = $pdo->query("
+    SELECT
+        DATE_FORMAT(ar.scan_time, '%H:%i') AS scan_time,
+        c.course_code,
+        u.matric_no,
+        u.full_name,
+        COALESCE(rc.uid, '-') AS uid,
+        ar.status
+    FROM attendance_records ar
+    JOIN users u ON u.user_id = ar.student_id
+    LEFT JOIN rfid_cards rc ON rc.card_id = ar.rfid_card_id
+    JOIN attendance_sessions ats ON ats.session_id = ar.session_id
+    JOIN class_schedule cs ON cs.schedule_id = ats.schedule_id
+    JOIN courses c ON c.course_id = cs.course_id
+    ORDER BY ar.scan_time DESC, ar.record_id DESC
+    LIMIT 8
+");
+$recentLogs = $recentLogsStmt->fetchAll();
+
+$recentActivityStmt = $pdo->query("
+    SELECT
+        ats.session_id,
+        c.course_code,
+        c.course_name,
+        ats.session_date,
+        TIME_FORMAT(ats.planned_start_time, '%H:%i') AS start_time,
+        TIME_FORMAT(ats.planned_end_time, '%H:%i') AS end_time,
+        ats.session_status,
+        ats.total_expected,
+        ats.total_present,
+        ats.total_absent
+    FROM attendance_sessions ats
+    JOIN class_schedule cs ON cs.schedule_id = ats.schedule_id
+    JOIN courses c ON c.course_id = cs.course_id
+    ORDER BY ats.session_date DESC, ats.planned_start_time DESC, ats.session_id DESC
+    LIMIT 6
+");
+$recentActivities = $recentActivityStmt->fetchAll();
+
+$monthlyRows = $pdo->query("
+    SELECT
+        MONTH(ats.session_date) AS month_no,
+        COUNT(ar.record_id) AS total_records,
+        SUM(CASE WHEN ar.status = 'present' THEN 1 ELSE 0 END) AS attended_records
+    FROM attendance_sessions ats
+    LEFT JOIN attendance_records ar ON ar.session_id = ats.session_id
+    WHERE YEAR(ats.session_date) = YEAR(CURDATE())
+    GROUP BY MONTH(ats.session_date)
+")->fetchAll();
+
+$monthLabels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+$monthlyTrend = [];
+for ($i = 1; $i <= 12; $i++) {
+    $monthlyTrend[$i] = [
+        'label' => $monthLabels[$i - 1],
+        'rate' => 0,
+        'total' => 0
+    ];
+}
+
+foreach ($monthlyRows as $row) {
+    $monthNo = (int)$row['month_no'];
+    $total = (int)$row['total_records'];
+    $attended = (int)$row['attended_records'];
+    $monthlyTrend[$monthNo]['rate'] = $total > 0 ? round(($attended / $total) * 100) : 0;
+    $monthlyTrend[$monthNo]['total'] = $total;
+}
+
+$dashboardData = [
+    'recentLogs' => array_map(function ($row) {
+        return [
+            'time' => $row['scan_time'] ?? '-',
+            'course' => $row['course_code'],
+            'studentId' => $row['matric_no'],
+            'name' => $row['full_name'],
+            'rfid' => $row['uid'],
+            'status' => $row['status']
+        ];
+    }, $recentLogs),
+    'activities' => array_map(function ($row) {
+        return [
+            'sessionId' => (int)$row['session_id'],
+            'time' => $row['session_date'] . ' ' . $row['start_time'] . '-' . $row['end_time'],
+            'course' => $row['course_code'] . ' - ' . $row['course_name'],
+            'status' => $row['session_status'],
+            'summary' => ((int)$row['total_present']) . '/' . ((int)$row['total_expected']) . ' present, ' . ((int)$row['total_absent']) . ' absent'
+        ];
+    }, $recentActivities),
+    'monthlyTrend' => array_values($monthlyTrend)
+];
+?>
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -162,6 +446,7 @@
             border-radius: 8px;
             border: none;
             font-weight: 500;
+            text-decoration: none;
             cursor: pointer;
             transition: var(--transition);
             display: inline-flex;
@@ -313,6 +598,9 @@
             background: var(--light);
             cursor: pointer;
             transition: var(--transition);
+            border: 0;
+            color: inherit;
+            font: inherit;
         }
 
         .admin-profile:hover {
@@ -325,6 +613,56 @@
             border-radius: 50%;
             object-fit: cover;
             border: 2px solid var(--primary);
+        }
+
+        .admin-menu {
+            position: relative;
+        }
+
+        .profile-caret {
+            color: var(--gray);
+            font-size: 0.8rem;
+        }
+
+        .admin-dropdown {
+            position: absolute;
+            right: 0;
+            top: calc(100% + 10px);
+            min-width: 180px;
+            padding: 8px;
+            border-radius: 14px;
+            background: white;
+            box-shadow: 0 18px 40px rgba(15, 23, 42, 0.16);
+            border: 1px solid rgba(67, 97, 238, 0.12);
+            opacity: 0;
+            visibility: hidden;
+            transform: translateY(-6px);
+            transition: var(--transition);
+            z-index: 20;
+        }
+
+        .admin-menu:hover .admin-dropdown,
+        .admin-menu:focus-within .admin-dropdown {
+            opacity: 1;
+            visibility: visible;
+            transform: translateY(0);
+        }
+
+        .admin-dropdown a {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 11px 12px;
+            border-radius: 10px;
+            color: var(--dark);
+            text-decoration: none;
+            font-weight: 600;
+            transition: var(--transition);
+        }
+
+        .admin-dropdown a:hover {
+            background: linear-gradient(135deg, rgba(6, 120, 88, 0.08), rgba(67, 97, 238, 0.08));
+            color: var(--primary);
         }
 
         /* SIDEBAR */
@@ -559,12 +897,56 @@
             justify-content: center;
             color: var(--gray);
             font-size: 1.1rem;
+            padding: 1rem;
         }
 
         .chart-placeholder i {
             font-size: 3rem;
             margin-bottom: 15px;
             color: #adb5bd;
+        }
+
+        .trend-chart {
+            width: 100%;
+            height: 100%;
+            display: grid;
+            grid-template-columns: repeat(12, minmax(28px, 1fr));
+            gap: 10px;
+            align-items: end;
+        }
+
+        .trend-bar-wrap {
+            height: 100%;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .trend-bar {
+            width: 100%;
+            max-width: 34px;
+            min-height: 6px;
+            border-radius: 8px 8px 4px 4px;
+            background: linear-gradient(180deg, var(--primary), var(--secondary));
+            box-shadow: 0 8px 16px rgba(67, 97, 238, 0.2);
+        }
+
+        .trend-label {
+            font-size: 0.78rem;
+            color: var(--gray);
+            white-space: nowrap;
+        }
+
+        .empty-state {
+            width: 100%;
+            padding: 1rem;
+            text-align: center;
+            color: var(--gray);
+            background: #f8f9fa;
+            border-radius: 10px;
         }
 
         /* TABLE */
@@ -606,7 +988,6 @@
         }
 
         .status-present { background: rgba(46, 204, 113, 0.15); color: #27ae60; }
-        .status-late { background: rgba(243, 156, 18, 0.15); color: #d35400; }
         .status-absent { background: rgba(231, 76, 60, 0.15); color: #c0392b; }
 
         /* QUICK ACTIONS */
@@ -670,33 +1051,145 @@
         .activity-list {
             display: flex;
             flex-direction: column;
-            gap: 1rem;
+            gap: 14px;
         }
 
         .activity-item {
-            display: flex;
-            justify-content: space-between;
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 18px;
             align-items: center;
-            padding: 1.2rem;
-            background: #f8f9fa;
-            border-radius: 10px;
-            border-left: 4px solid var(--primary);
+            padding: 18px;
+            background: linear-gradient(135deg, #ffffff, #f8fbff);
+            border: 1px solid #e3eaf4;
+            border-radius: 14px;
+            border-left: 5px solid var(--primary);
+            box-shadow: 0 10px 24px rgba(28, 52, 84, 0.06);
+            transition: var(--transition);
+        }
+
+        .activity-item:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 16px 34px rgba(28, 52, 84, 0.1);
+        }
+
+        .activity-main {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            min-width: 0;
+        }
+
+        .activity-icon {
+            width: 48px;
+            height: 48px;
+            border-radius: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            background: linear-gradient(135deg, #006837, #4361ee);
+            box-shadow: 0 10px 20px rgba(67, 97, 238, 0.16);
+            flex: 0 0 auto;
+        }
+
+        .activity-info {
+            min-width: 0;
+        }
+
+        .activity-item > div:first-child:not(.activity-main) {
+            position: relative;
+            min-width: 0;
+            padding-left: 62px;
+        }
+
+        .activity-item > div:first-child:not(.activity-main)::before {
+            content: "\f274";
+            font-family: "Font Awesome 6 Free";
+            font-weight: 900;
+            position: absolute;
+            left: 0;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 48px;
+            height: 48px;
+            border-radius: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            background: linear-gradient(135deg, #006837, #4361ee);
+            box-shadow: 0 10px 20px rgba(67, 97, 238, 0.16);
         }
 
         .activity-time {
-            font-size: 1.1rem;
-            font-weight: 600;
+            font-size: 1.05rem;
+            font-weight: 800;
             color: var(--dark);
+            line-height: 1.3;
         }
 
         .activity-course {
-            color: var(--gray);
+            color: #52647a;
             font-size: 0.9rem;
+            margin-top: 3px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .activity-meta {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-top: 10px;
+        }
+
+        .activity-status {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 10px;
+            border-radius: 999px;
+            font-size: 0.76rem;
+            font-weight: 900;
+            text-transform: uppercase;
+            letter-spacing: 0.02em;
+        }
+
+        .activity-status.completed {
+            background: rgba(46, 204, 113, 0.14);
+            color: #047857;
+        }
+
+        .activity-status.ongoing {
+            background: rgba(67, 97, 238, 0.12);
+            color: #304ed8;
+        }
+
+        .activity-status.scheduled {
+            background: rgba(243, 156, 18, 0.14);
+            color: #b45309;
+        }
+
+        .activity-summary {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 10px;
+            border-radius: 999px;
+            background: #f1f5f9;
+            color: #52647a;
+            font-size: 0.82rem;
+            font-weight: 700;
         }
 
         .activity-actions {
             display: flex;
             gap: 10px;
+            align-items: center;
+            justify-content: flex-end;
         }
 
         .btn-view {
@@ -710,10 +1203,35 @@
             border: 1px solid var(--primary);
         }
 
+        .activity-actions .btn {
+            min-width: 96px;
+            justify-content: center;
+            border-radius: 12px;
+            min-height: 42px;
+        }
+
         /* RESPONSIVE */
         @media (max-width: 1200px) {
             .content-grid {
                 grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 760px) {
+            .activity-item {
+                grid-template-columns: 1fr;
+            }
+
+            .activity-actions {
+                justify-content: stretch;
+            }
+
+            .activity-actions .btn {
+                flex: 1;
+            }
+
+            .activity-item > div:first-child:not(.activity-main) {
+                padding-left: 58px;
             }
         }
 
@@ -762,6 +1280,7 @@
             }
         }
     </style>
+    <link rel="stylesheet" href="../assets/css/app-polish.css">
 </head>
 <body>
     <!-- MODALS -->
@@ -786,9 +1305,16 @@
                     
                     <div class="form-row">
                         <div class="form-group">
-                            <label class="form-label">Course Code</label>
-                            <input type="text" class="form-control" id="courseCode" placeholder="e.g., BIC20403" required>
-                        </div>
+    <label class="form-label">Course</label>
+    <select class="form-control" id="courseCode" required>
+        <option value="" selected disabled>Select Course</option>
+        <option value="BIW">BIW</option>
+        <option value="BIM">BIM</option>
+        <option value="BIP">BIP</option>
+        <option value="BIT">BIT</option>
+        <option value="BIS">BIS</option>
+    </select>
+</div>
                         <div class="form-group">
                             <label class="form-label">Email</label>
                             <input type="email" class="form-control" id="studentEmail" placeholder="student@university.edu" required>
@@ -803,19 +1329,16 @@
                         <div class="form-group">
                             <label class="form-label">Semester</label>
                             <select class="form-control" id="semester">
-                                <option value="1">Semester 1</option>
-                                <option value="2">Semester 2</option>
-                                <option value="3">Semester 3</option>
-                                <option value="4" selected>Semester 4</option>
-                                <option value="5">Semester 5</option>
-                                <option value="6">Semester 6</option>
+                                <option value="1" selected>Year 1 Semester 1</option>
+                                <option value="2">Year 1 Semester 2</option>
+                                <option value="3">Year 2 Semester 1</option>
+                                <option value="4">Year 2 Semester 2</option>
+                                <option value="5">Year 3 Semester 1</option>
+                                <option value="6">Year 3 Semester 2</option>
+                                <option value="5">Year 4 Semester 1</option>
+                                <option value="6">Year 4 Semester 2</option>
                             </select>
                         </div>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label class="form-label">Notes</label>
-                        <textarea class="form-control" id="studentNotes" rows="3" placeholder="Additional information..."></textarea>
                     </div>
                 </form>
             </div>
@@ -848,17 +1371,18 @@
                 
                 <div class="form-group">
                     <label class="form-label">RFID UID</label>
-                    <input type="text" class="form-control" id="rfidUid" placeholder="e.g., 43F3X2" readonly>
+                    <input type="text" class="form-control" id="rfidUid" placeholder="e.g., 60CCFC61">
                 </div>
                 
                 <div class="form-group">
                     <label class="form-label">Assign to Student</label>
                     <select class="form-control" id="assignStudent">
                         <option value="">Select a student...</option>
-                        <option value="DI230076">DI230076 - Nur Alya</option>
-                        <option value="DI230081">DI230081 - Adam</option>
-                        <option value="BIE20009">BIE20009 - Idbal</option>
-                        <option value="DI230110">DI230110 - Siti</option>
+                        <?php foreach ($studentOptions as $studentOption): ?>
+                            <option value="<?= htmlspecialchars($studentOption['user_id']) ?>">
+                                <?= htmlspecialchars($studentOption['matric_no'] . ' - ' . $studentOption['full_name']) ?>
+                            </option>
+                        <?php endforeach; ?>
                     </select>
                 </div>
                 
@@ -867,7 +1391,6 @@
                     <select class="form-control" id="cardType">
                         <option value="student">Student Card</option>
                         <option value="lecturer">Lecturer Card</option>
-                        <option value="staff">Staff Card</option>
                     </select>
                 </div>
                 
@@ -897,9 +1420,11 @@
                     <label class="form-label">Course</label>
                     <select class="form-control" id="timetableCourse">
                         <option value="">Select course...</option>
-                        <option value="BIC20403">BIC20403 - Database Systems</option>
-                        <option value="BIC31502">BIC31502 - Web Development</option>
-                        <option value="BIE20203">BIE20203 - Operating Systems</option>
+                        <?php foreach ($courseOptions as $courseOption): ?>
+                            <option value="<?= htmlspecialchars($courseOption['course_id']) ?>">
+                                <?= htmlspecialchars($courseOption['course_code'] . ' - ' . $courseOption['course_name']) ?>
+                            </option>
+                        <?php endforeach; ?>
                     </select>
                 </div>
                 
@@ -912,7 +1437,6 @@
                             <option value="wednesday">Wednesday</option>
                             <option value="thursday">Thursday</option>
                             <option value="friday">Friday</option>
-                            <option value="saturday">Saturday</option>
                         </select>
                     </div>
                     
@@ -937,9 +1461,6 @@
                 <div class="form-group">
                     <label class="form-label">Attendance Rules</label>
                     <div style="margin-top: 0.5rem;">
-                        <label style="display: block; margin-bottom: 0.5rem;">
-                            <input type="checkbox" id="allowLate" checked> Allow late attendance (within 15 minutes)
-                        </label>
                         <label style="display: block; margin-bottom: 0.5rem;">
                             <input type="checkbox" id="requireRFID" checked> Require RFID check-in
                         </label>
@@ -978,12 +1499,12 @@
                 <div class="form-row">
                     <div class="form-group">
                         <label class="form-label">Date From</label>
-                        <input type="date" class="form-control" id="exportFrom" value="2024-01-01">
+                        <input type="date" class="form-control" id="exportFrom" value="2026-01-01">
                     </div>
                     
                     <div class="form-group">
                         <label class="form-label">Date To</label>
-                        <input type="date" class="form-control" id="exportTo" value="2024-12-31">
+                        <input type="date" class="form-control" id="exportTo" value="2026-12-31">
                     </div>
                 </div>
                 
@@ -1059,11 +1580,15 @@
                     <span id="rfidReaders">RFID Readers: 8 Active</span>
                 </div>
                 
-                <div class="admin-profile">
-                    <img src="https://ui-avatars.com/api/?name=Admin+User&background=4361ee&color=fff&size=128" alt="Admin">
-                    <div>
+                <div class="admin-menu">
+                    <button type="button" class="admin-profile">
+                        <img src="https://ui-avatars.com/api/?name=Admin+User&background=4361ee&color=fff&size=128" alt="Admin">
                         <div style="font-weight: 600;">Admin</div>
-                        <div style="font-size: 0.85rem; color: var(--gray);">Super Admin</div>
+                        <i class="fas fa-chevron-down profile-caret"></i>
+                    </button>
+                    <div class="admin-dropdown">
+                        <a href="../admin/settings.php"><i class="fas fa-cog"></i> Settings</a>
+                        <a href="../logout.php"><i class="fas fa-sign-out-alt"></i> Logout</a>
                     </div>
                 </div>
             </div>
@@ -1099,29 +1624,6 @@
 </li>
                 </ul>
             </div>
-            
-            <div class="sidebar-section">
-                <h3>System</h3>
-                <ul class="nav-menu">
-                    <li class="nav-item">
-                        <i class="fas fa-cog"></i>
-                        <span>Settings</span>
-                    </li>
-                    <li class="nav-item">
-                        <i class="fas fa-bell"></i>
-                        <span>Notifications</span>
-                    </li>
-                    <li class="nav-item">
-                        <i class="fas fa-shield-alt"></i>
-                        <span>Security</span>
-                    </li>
-                </ul>
-            </div>
-            
-            <button class="logout-btn" onclick="window.location.href='../logout.php'">
-                <i class="fas fa-sign-out-alt"></i>
-                <span>Logout</span>
-            </button>
         </nav>
 
         <!-- MAIN CONTENT -->
@@ -1153,46 +1655,46 @@
                 <div class="stat-card">
                     <div class="stat-header">
                         <div>
-                            <div class="stat-number" id="totalStudents">1,280</div>
+                            <div class="stat-number" id="totalStudents"><?= number_format($totalStudents) ?></div>
                             <div class="stat-label">Total Students</div>
                         </div>
                         <div class="stat-icon students">
                             <i class="fas fa-user-graduate"></i>
                         </div>
                     </div>
-                    <div class="stat-sub">Active cards: <span id="activeCards">1,245</span></div>
+                    <div class="stat-sub">Active cards: <span id="activeCards"><?= number_format($activeCards) ?></span></div>
                 </div>
                 
                 <div class="stat-card">
                     <div class="stat-header">
                         <div>
-                            <div class="stat-number" id="totalLecturers">86</div>
+                            <div class="stat-number" id="totalLecturers"><?= number_format($totalLecturers) ?></div>
                             <div class="stat-label">Total Lecturers</div>
                         </div>
                         <div class="stat-icon lecturers">
                             <i class="fas fa-chalkboard-teacher"></i>
                         </div>
                     </div>
-                    <div class="stat-sub">Logged today: <span id="loggedToday">78</span></div>
+                    <div class="stat-sub">Logged today: <span id="loggedToday"><?= number_format($loggedToday) ?></span></div>
                 </div>
                 
                 <div class="stat-card">
                     <div class="stat-header">
                         <div>
-                            <div class="stat-number" id="totalCourses">143</div>
+                            <div class="stat-number" id="totalCourses"><?= number_format($totalCourses) ?></div>
                             <div class="stat-label">Courses (This Sem)</div>
                         </div>
                         <div class="stat-icon courses">
                             <i class="fas fa-book-open"></i>
                         </div>
                     </div>
-                    <div class="stat-sub">Timetables updated: <span id="timetableUpdated">98%</span></div>
+                    <div class="stat-sub">Timetables updated: <span id="timetableUpdated"><?= number_format($totalSchedules) ?></span></div>
                 </div>
                 
                 <div class="stat-card">
                     <div class="stat-header">
                         <div>
-                            <div class="stat-number" id="todayAttendance">2,954</div>
+                            <div class="stat-number" id="todayAttendance"><?= number_format($todayAttendance) ?></div>
                             <div class="stat-label">Today Attendance</div>
                         </div>
                         <div class="stat-icon attendance">
@@ -1200,9 +1702,8 @@
                         </div>
                     </div>
                     <div class="stat-sub">
-                        <span style="color: #27ae60;">● <span id="presentCount">112</span> Present</span> | 
-                        <span style="color: #d35400;">● <span id="lateCount">64</span> Late</span> | 
-                        <span style="color: #c0392b;">● <span id="absentCount">38</span> Absent</span>
+                        <span style="color: #27ae60;">● <span id="presentCount"><?= number_format($presentCount) ?></span> Present</span> | 
+                        <span style="color: #c0392b;">● <span id="absentCount"><?= number_format($absentCount) ?></span> Absent</span>
                     </div>
                 </div>
             </div>
@@ -1212,23 +1713,19 @@
                 <div class="card">
                     <div class="card-header">
                         <div class="card-title">Monthly Attendance Trend</div>
-                        <div style="font-size: 1.2rem; font-weight: 700; color: var(--primary);" id="attendanceRate">94.2%</div>
+                        <div style="font-size: 1.2rem; font-weight: 700; color: var(--primary);" id="attendanceRate"><?= $attendanceRate ?>%</div>
                     </div>
                     <div class="chart-placeholder">
-                        <div style="text-align: center;">
-                            <i class="fas fa-chart-line"></i>
-                            <div>Attendance trend visualization</div>
-                            <div style="font-size: 0.9rem; margin-top: 10px;">Jan 2024 - Dec 2024</div>
-                        </div>
+                        <div class="trend-chart" id="monthlyTrendChart"></div>
                     </div>
                 </div>
                 
                 <div class="card">
                     <div class="card-header">
                         <div class="card-title">Recent Attendance Logs</div>
-                        <button class="btn btn-view" onclick="viewAllLogs()">
+                        <a class="btn btn-view" href="reports.php">
                             <i class="fas fa-eye"></i> View All
-                        </button>
+                        </a>
                     </div>
                     <div class="table-container">
                         <table id="attendanceTable">
@@ -1303,28 +1800,17 @@
     </div>
 
     <script>
-        // Sample Data
-        const attendanceData = [
-            { time: "08:01", course: "BIC20403", studentId: "DI230076", name: "Nur Alya", rfid: "43F3X2", status: "present" },
-            { time: "08:06", course: "BIC31502", studentId: "DI230081", name: "Adam", rfid: "F1C02B", status: "late" },
-            { time: "08:10", course: "BIE20203", studentId: "BIE20009", name: "Idbal", rfid: "929301", status: "absent" },
-            { time: "14:03", course: "BIC20403", studentId: "DI230110", name: "Siti", rfid: "882201", status: "present" },
-            { time: "14:15", course: "BIC20403", studentId: "DI230115", name: "Ahmad", rfid: "A1B2C3", status: "present" },
-            { time: "14:20", course: "BIC31502", studentId: "DI230120", name: "Sarah", rfid: "D4E5F6", status: "late" }
-        ];
-
-        const activities = [
-            { time: "15:03:42", course: "FTC301 - Web Development" },
-            { time: "14:03:05", course: "OST202 - Operating Systems" },
-            { time: "13:45:22", course: "DBM401 - Database Management" },
-            { time: "11:20:15", course: "NET301 - Networking" }
-        ];
+        const dashboardData = <?= json_encode($dashboardData, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
+        const attendanceData = dashboardData.recentLogs;
+        const activities = dashboardData.activities;
+        const monthlyTrend = dashboardData.monthlyTrend;
 
         // Initialize dashboard
         document.addEventListener('DOMContentLoaded', function() {
+            populateMonthlyTrend();
             populateAttendanceTable();
             populateActivities();
-            updateLiveStats();
+            //updateLiveStats();
             
             // Set active nav item
             const navItems = document.querySelectorAll('.nav-item');
@@ -1336,23 +1822,13 @@
                 });
             });
             
-            // Simulate RFID scan in modal
-            document.getElementById('registerRFIDModal').addEventListener('click', function(e) {
-                if (e.target.closest('.modal-content')) return;
-                simulateRFIDScan();
-            });
-            
             // Auto refresh data every 30 seconds
-            setInterval(updateLiveStats, 30000);
+            //setInterval(updateLiveStats, 30000);
         });
 
         // Modal Functions
         function openModal(modalId) {
             document.getElementById(modalId).style.display = 'flex';
-            
-            if (modalId === 'registerRFIDModal') {
-                simulateRFIDScan();
-            }
         }
 
         function closeModal(modalId) {
@@ -1400,33 +1876,40 @@
         function addStudent() {
             const studentId = document.getElementById('studentId').value;
             const studentName = document.getElementById('studentName').value;
+            const studentEmail = document.getElementById('studentEmail').value;
             
-            if (!studentId || !studentName) {
+            if (!studentId || !studentName || !studentEmail) {
                 showToast('Please fill in all required fields', 'error');
                 return;
             }
-            
-            // Update stats
-            const totalStudents = document.getElementById('totalStudents');
-            totalStudents.textContent = parseInt(totalStudents.textContent) + 1;
-            
-            const activeCards = document.getElementById('activeCards');
-            activeCards.textContent = parseInt(activeCards.textContent) + 1;
-            
-            // Add to table
-            attendanceData.unshift({
-                time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}),
-                course: document.getElementById('courseCode').value,
-                studentId: studentId,
-                name: studentName,
-                rfid: 'Pending',
-                status: 'absent'
-            });
-            
-            populateAttendanceTable();
-            closeModal('addStudentModal');
-            document.getElementById('addStudentForm').reset();
-            showToast(`Student ${studentName} added successfully!`, 'success');
+
+            const formData = new URLSearchParams();
+            formData.append('action', 'add_student');
+            formData.append('student_id', studentId);
+            formData.append('student_name', studentName);
+            formData.append('email', studentEmail);
+            formData.append('phone', document.getElementById('studentPhone').value);
+            formData.append('department', document.getElementById('courseCode').value);
+            formData.append('semester', document.getElementById('semester').value);
+
+            fetch('dashboard.php', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: formData.toString()
+            })
+                .then(response => response.json())
+                .then(data => {
+                    if (!data.ok) {
+                        showToast(data.message, 'error');
+                        return;
+                    }
+
+                    closeModal('addStudentModal');
+                    document.getElementById('addStudentForm').reset();
+                    showToast(data.message, 'success');
+                    setTimeout(() => window.location.reload(), 700);
+                })
+                .catch(() => showToast('Unable to add student. Please try again.', 'error'));
         }
 
         function simulateRFIDScan() {
@@ -1452,27 +1935,38 @@
         }
 
         function registerRFID() {
-            const rfidUid = document.getElementById('rfidUid').value;
+            const rfidUid = document.getElementById('rfidUid').value.trim().toUpperCase();
             const student = document.getElementById('assignStudent').value;
             
             if (!rfidUid || !student) {
-                showToast('Please scan a card and assign to a student', 'error');
+                showToast('Please enter RFID UID and assign to a student', 'error');
                 return;
             }
-            
-            // Find student in data and update RFID
-            const studentData = attendanceData.find(item => item.studentId === student);
-            if (studentData) {
-                studentData.rfid = rfidUid;
-                populateAttendanceTable();
-            }
-            
-            // Update active cards count
-            const activeCards = document.getElementById('activeCards');
-            activeCards.textContent = parseInt(activeCards.textContent) + 1;
-            
-            closeModal('registerRFIDModal');
-            showToast(`RFID card ${rfidUid} registered to student ${student}`, 'success');
+
+            const formData = new URLSearchParams();
+            formData.append('action', 'register_rfid');
+            formData.append('user_id', student);
+            formData.append('uid', rfidUid);
+            formData.append('card_type', document.getElementById('cardType').value);
+            formData.append('activate_now', document.getElementById('activateNow').checked ? '1' : '0');
+
+            fetch('dashboard.php', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: formData.toString()
+            })
+                .then(response => response.json())
+                .then(data => {
+                    if (!data.ok) {
+                        showToast(data.message, 'error');
+                        return;
+                    }
+
+                    closeModal('registerRFIDModal');
+                    showToast(data.message, 'success');
+                    setTimeout(() => window.location.reload(), 700);
+                })
+                .catch(() => showToast('Unable to register RFID. Please try again.', 'error'));
         }
 
         function saveTimetable() {
@@ -1480,47 +1974,98 @@
             const day = document.getElementById('timetableDay').value;
             const time = document.getElementById('timetableTime').value;
             
-            if (!course) {
-                showToast('Please select a course', 'error');
+            if (!course || !time || !document.getElementById('timetableRoom').value) {
+                showToast('Please select course, time and room', 'error');
                 return;
             }
-            
-            // Update timetable updated percentage
-            const timetableUpdated = document.getElementById('timetableUpdated');
-            let percentage = parseInt(timetableUpdated.textContent);
-            if (percentage < 100) percentage += 2;
-            timetableUpdated.textContent = percentage + '%';
-            
-            closeModal('timetableModal');
-            showToast(`Timetable for ${course} saved successfully`, 'success');
+
+            const formData = new URLSearchParams();
+            formData.append('action', 'save_timetable');
+            formData.append('course_id', course);
+            formData.append('day', day);
+            formData.append('start_time', time);
+            formData.append('duration', document.getElementById('timetableDuration').value);
+            formData.append('room', document.getElementById('timetableRoom').value);
+
+            fetch('dashboard.php', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: formData.toString()
+            })
+                .then(response => response.json())
+                .then(data => {
+                    if (!data.ok) {
+                        showToast(data.message, 'error');
+                        return;
+                    }
+
+                    closeModal('timetableModal');
+                    showToast(data.message, 'success');
+                    setTimeout(() => window.location.reload(), 700);
+                })
+                .catch(() => showToast('Unable to save timetable. Please try again.', 'error'));
         }
 
         function exportReport() {
             const exportType = document.getElementById('exportType').value;
             const format = document.querySelector('input[name="exportFormat"]:checked').value;
-            
-            // Simulate export process
-            showToast(`Exporting ${exportType} report as ${format.toUpperCase()}...`, 'info');
-            
-            setTimeout(() => {
-                closeModal('exportModal');
-                showToast(`Report exported successfully! Download will begin shortly.`, 'success');
-                
-                // Simulate download
-                const link = document.createElement('a');
-                link.href = 'data:text/csv;charset=utf-8,Report%20data';
-                link.download = `attendance_report_${new Date().toISOString().slice(0,10)}.${format}`;
-                link.style.display = 'none';
-                document.body.appendChild(link);
-                link.click();
-                document.body.removeChild(link);
-            }, 2000);
+            const exportFormat = format === 'excel' ? 'csv' : format;
+            const from = document.getElementById('exportFrom').value;
+            const to = document.getElementById('exportTo').value;
+
+            const routeMap = {
+                attendance: `export_dashboard_report.php?type=attendance&format=${encodeURIComponent(exportFormat)}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+                students: `export_users.php?role=student&format=${encodeURIComponent(exportFormat)}`,
+                courses: `export_courses.php?scope=all&format=${encodeURIComponent(exportFormat)}`,
+                rfid: `export_dashboard_report.php?type=rfid&format=${encodeURIComponent(exportFormat)}`
+            };
+
+            closeModal('exportModal');
+            window.location.href = routeMap[exportType] || routeMap.attendance;
         }
 
         // Dashboard Functions
+        function populateMonthlyTrend() {
+            const chart = document.getElementById('monthlyTrendChart');
+            chart.innerHTML = '';
+
+            const hasData = monthlyTrend.some(month => month.total > 0);
+            if (!hasData) {
+                chart.innerHTML = `
+                    <div class="empty-state" style="grid-column: 1 / -1;">
+                        <i class="fas fa-chart-line" style="display: block; font-size: 2rem; margin-bottom: 0.75rem;"></i>
+                        No attendance records yet for this year.
+                    </div>
+                `;
+                return;
+            }
+
+            monthlyTrend.forEach(month => {
+                const wrap = document.createElement('div');
+                wrap.className = 'trend-bar-wrap';
+                wrap.title = `${month.label}: ${month.rate}% attendance (${month.total} records)`;
+                wrap.innerHTML = `
+                    <div class="trend-bar" style="height: ${Math.max(month.rate, 4)}%; opacity: ${month.total > 0 ? 1 : 0.25};"></div>
+                    <div class="trend-label">${month.label}</div>
+                `;
+                chart.appendChild(wrap);
+            });
+        }
+
         function populateAttendanceTable() {
             const tbody = document.getElementById('attendanceTableBody');
             tbody.innerHTML = '';
+
+            if (attendanceData.length === 0) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="6">
+                            <div class="empty-state">No attendance logs yet. Student scans will appear here after a session is active.</div>
+                        </td>
+                    </tr>
+                `;
+                return;
+            }
             
             attendanceData.forEach(item => {
                 const row = document.createElement('tr');
@@ -1531,10 +2076,6 @@
                     case 'present':
                         statusClass = 'status-present';
                         statusText = 'Present';
-                        break;
-                    case 'late':
-                        statusClass = 'status-late';
-                        statusText = 'Late';
                         break;
                     case 'absent':
                         statusClass = 'status-absent';
@@ -1558,6 +2099,11 @@
         function populateActivities() {
             const activityList = document.getElementById('activityList');
             activityList.innerHTML = '';
+
+            if (activities.length === 0) {
+                activityList.innerHTML = '<div class="empty-state">No attendance sessions created yet.</div>';
+                return;
+            }
             
             activities.forEach(activity => {
                 const activityItem = document.createElement('div');
@@ -1566,10 +2112,11 @@
                     <div>
                         <div class="activity-time">${activity.time}</div>
                         <div class="activity-course">${activity.course}</div>
+                        <div style="color: var(--gray); font-size: 0.9rem; margin-top: 4px;">${activity.status.toUpperCase()} • ${activity.summary}</div>
                     </div>
                     <div class="activity-actions">
-                        <button class="btn btn-view" onclick="viewActivity('${activity.course}')">View</button>
-                        <button class="btn btn-export" onclick="exportActivity('${activity.course}')">Export</button>
+                        <button class="btn btn-view" onclick="viewActivity(${activity.sessionId})"><i class="fas fa-eye"></i> View</button>
+                        <button class="btn btn-export" onclick="exportActivity(${activity.sessionId})"><i class="fas fa-file-export"></i> Export</button>
                     </div>
                 `;
                 activityList.appendChild(activityItem);
@@ -1579,12 +2126,10 @@
         function updateLiveStats() {
             // Simulate live data updates
             const present = Math.floor(Math.random() * 20) + 100;
-            const late = Math.floor(Math.random() * 10) + 60;
             const absent = Math.floor(Math.random() * 5) + 35;
-            const total = present + late + absent;
+            const total = present + absent;
             
             document.getElementById('presentCount').textContent = present;
-            document.getElementById('lateCount').textContent = late;
             document.getElementById('absentCount').textContent = absent;
             document.getElementById('todayAttendance').textContent = total;
             
@@ -1651,16 +2196,15 @@
         }
 
         function viewAllLogs() {
-            showToast('Opening all attendance logs...', 'info');
-            // Implement view all logs functionality
+            window.location.href = 'reports.php';
         }
 
-        function viewActivity(course) {
-            showToast(`Viewing details for ${course}`, 'info');
+        function viewActivity(sessionId) {
+            window.location.href = `session_view.php?session_id=${encodeURIComponent(sessionId)}`;
         }
 
-        function exportActivity(course) {
-            showToast(`Exporting data for ${course}`, 'success');
+        function exportActivity(sessionId) {
+            window.location.href = `export_attendance.php?session_id=${encodeURIComponent(sessionId)}&format=pdf&from=dashboard`;
         }
 
         function logout() {

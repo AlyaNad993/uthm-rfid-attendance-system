@@ -7,6 +7,10 @@ require_once __DIR__ . '/../includes/config.php';
 $lecturer_id = $_SESSION['user_id'];
 $today = date('l'); // Monday, Tuesday, ...
 
+$stmt = $pdo->prepare("SELECT full_name FROM users WHERE user_id = ? LIMIT 1");
+$stmt->execute([$lecturer_id]);
+$lecturerName = $stmt->fetchColumn() ?: ($_SESSION['name'] ?? 'Lecturer');
+
 /* =========================
    KPI DATA
    ========================= */
@@ -39,42 +43,74 @@ $stmt = $pdo->prepare("
     JOIN attendance_sessions s ON ar.session_id = s.session_id
     JOIN class_schedule cs ON s.schedule_id = cs.schedule_id
     WHERE cs.lecturer_id = ?
-      AND DATE(ar.scan_time) = CURDATE()
+      AND s.session_date = CURDATE()
+      AND ar.status = 'present'
 ");
 $stmt->execute([$lecturer_id]);
 $students_today = $stmt->fetchColumn();
 
 // At-risk students (< 80%)
-$at_risk = 0; // Placeholder – computed in reports module
-
-/* =========================
-   TODAY'S CLASSES LIST
-   ========================= */
 $stmt = $pdo->prepare("
-    SELECT 
-        cs.schedule_id,
-        cs.start_time,
-        cs.end_time,
-        r.room_name,
-        c.course_code,
-        c.course_name
+    SELECT COUNT(DISTINCT e.student_id)
     FROM class_schedule cs
-    JOIN courses c ON cs.course_id = c.course_id
-    LEFT JOIN rooms r ON cs.room_id = r.room_id
+    JOIN enrollments e
+      ON cs.course_id = e.course_id
+     AND e.section_name = cs.section_name
+     AND COALESCE(e.academic_year, '') = COALESCE(cs.academic_year, '')
     WHERE cs.lecturer_id = ?
       AND cs.day_of_week = ?
       AND cs.is_active = 1
-      AND (
-            cs.repeat_weekly = 1
-            OR (
-                cs.start_date <= CURDATE()
-                AND (cs.end_date IS NULL OR cs.end_date >= CURDATE())
-            )
-          )
-    ORDER BY cs.start_time
+      AND e.status = 'registered'
 ");
 $stmt->execute([$lecturer_id, $today]);
-$today_classes = $stmt->fetchAll();
+$total_enrolled = (int)$stmt->fetchColumn();
+
+$attendance_rate = $total_enrolled > 0 ? round(((int)$students_today / $total_enrolled) * 100) : 0;
+
+$stmt = $pdo->prepare("
+    SELECT COUNT(*)
+    FROM (
+        SELECT
+            ar.student_id,
+            SUM(CASE WHEN ar.status = 'present' THEN 1 ELSE 0 END) AS attended_count,
+            SUM(CASE WHEN ar.status IN ('present', 'late', 'absent') THEN 1 ELSE 0 END) AS marked_count
+        FROM attendance_records ar
+        JOIN attendance_sessions s ON ar.session_id = s.session_id
+        JOIN class_schedule cs ON s.schedule_id = cs.schedule_id
+        WHERE cs.lecturer_id = ?
+        GROUP BY ar.student_id
+        HAVING marked_count > 0
+           AND (attended_count / marked_count) < 0.8
+    ) risk
+");
+$stmt->execute([$lecturer_id]);
+$at_risk = (int)$stmt->fetchColumn();
+
+$stmt = $pdo->prepare("
+    SELECT
+        s.session_id,
+        s.session_date,
+        s.planned_start_time,
+        s.planned_end_time,
+        s.session_status,
+        s.total_expected,
+        s.total_present,
+        s.total_late,
+        s.total_absent,
+        c.course_code,
+        c.course_name,
+        r.room_name,
+        r.room_code
+    FROM attendance_sessions s
+    JOIN class_schedule cs ON s.schedule_id = cs.schedule_id
+    JOIN courses c ON cs.course_id = c.course_id
+    LEFT JOIN rooms r ON cs.room_id = r.room_id
+    WHERE cs.lecturer_id = ?
+    ORDER BY s.session_date DESC, s.planned_start_time DESC
+    LIMIT 5
+");
+$stmt->execute([$lecturer_id]);
+$recent_sessions = $stmt->fetchAll();
 ?>
 
 <!DOCTYPE html>
@@ -184,6 +220,7 @@ $today_classes = $stmt->fetchAll();
         }
 
         .lecturer-profile {
+            position: relative;
             display: flex;
             align-items: center;
             gap: 10px;
@@ -192,6 +229,8 @@ $today_classes = $stmt->fetchAll();
             background: var(--lecturer-light);
             cursor: pointer;
             transition: var(--transition);
+            border: 0;
+            color: inherit;
         }
 
         .lecturer-profile:hover {
@@ -204,6 +243,61 @@ $today_classes = $stmt->fetchAll();
             border-radius: 50%;
             object-fit: cover;
             border: 2px solid var(--lecturer-primary);
+        }
+
+        .lecturer-menu {
+            position: relative;
+        }
+
+        .profile-caret {
+            color: var(--lecturer-gray);
+            font-size: 0.8rem;
+            margin-left: 4px;
+        }
+
+        .lecturer-dropdown {
+            position: absolute;
+            right: 0;
+            top: calc(100% + 10px);
+            width: 230px;
+            padding: 8px;
+            background: white;
+            border: 1px solid var(--lecturer-border);
+            border-radius: 14px;
+            box-shadow: 0 18px 40px rgba(15, 23, 42, 0.16);
+            opacity: 0;
+            visibility: hidden;
+            transform: translateY(-6px);
+            transition: var(--transition);
+            z-index: 40;
+        }
+
+        .lecturer-menu:hover .lecturer-dropdown,
+        .lecturer-menu:focus-within .lecturer-dropdown {
+            opacity: 1;
+            visibility: visible;
+            transform: translateY(0);
+        }
+
+        .lecturer-dropdown a {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px;
+            border-radius: 10px;
+            color: var(--lecturer-dark);
+            text-decoration: none;
+            font-weight: 700;
+            transition: var(--transition);
+        }
+
+        .lecturer-dropdown a:hover {
+            background: linear-gradient(135deg, rgba(0, 104, 55, 0.08), rgba(67, 97, 238, 0.08));
+            color: #006837;
+        }
+
+        .lecturer-dropdown .danger-link {
+            color: var(--lecturer-danger);
         }
 
         /* SIDEBAR */
@@ -254,27 +348,6 @@ $today_classes = $stmt->fetchAll();
             width: 20px;
             text-align: center;
             font-size: 1.2rem;
-        }
-
-        .logout-btn {
-            margin-top: auto;
-            background: linear-gradient(135deg, #ff6b6b, #ee5a52);
-            color: white;
-            border: none;
-            padding: 14px;
-            border-radius: var(--border-radius);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 10px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: var(--transition);
-        }
-
-        .logout-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 12px rgba(255, 107, 107, 0.3);
         }
 
         /* MAIN CONTENT */
@@ -560,38 +633,6 @@ $today_classes = $stmt->fetchAll();
             transform: translateY(0);
         }
 
-        /* QUICK ATTENDANCE */
-        .quick-attendance {
-            background: linear-gradient(135deg, var(--lecturer-accent), #0891b2);
-            color: white;
-            margin-top: 1rem;
-        }
-
-        .attendance-summary {
-            text-align: center;
-        }
-
-        .attendance-stats {
-            display: flex;
-            justify-content: space-around;
-            margin: 1.5rem 0;
-        }
-
-        .attendance-stat {
-            text-align: center;
-        }
-
-        .attendance-stat .number {
-            font-size: 2rem;
-            font-weight: 700;
-            display: block;
-        }
-
-        .attendance-stat .label {
-            font-size: 0.9rem;
-            opacity: 0.8;
-        }
-
         /* QUICK ACTIONS */
         .quick-actions {
             display: grid;
@@ -738,6 +779,9 @@ $today_classes = $stmt->fetchAll();
             }
         }
     </style>
+    <link rel="stylesheet" href="../assets/css/lecturer-theme.css">
+    <link rel="stylesheet" href="../assets/css/app-polish.css">
+    <link rel="stylesheet" href="../assets/css/lecturer-polish.css">
 </head>
 <body>
     <!-- DASHBOARD -->
@@ -758,14 +802,28 @@ $today_classes = $stmt->fetchAll();
                     <span>Teaching Mode</span>
                 </div>
                 
-                <div class="lecturer-profile">
-                    <img src="https://ui-avatars.com/api/?name=<?= urlencode($_SESSION['name'] ?? 'Lecturer') ?>&background=4f46e5&color=fff&size=128" 
-                         alt="Lecturer">
-                    <div>
-                        <div style="font-weight: 600;"><?= htmlspecialchars($_SESSION['name'] ?? 'Lecturer') ?></div>
-                        <div style="font-size: 0.85rem; color: var(--lecturer-gray);">
-                            <i class="far fa-calendar-alt"></i> <?= date('F j, Y') ?>
+                <div class="lecturer-menu">
+                    <button type="button" class="lecturer-profile">
+                        <img src="https://ui-avatars.com/api/?name=<?= urlencode($lecturerName) ?>&background=006837&color=fff&size=128" 
+                             alt="Lecturer">
+                        <div>
+                            <div style="font-weight: 600;"><?= htmlspecialchars($lecturerName) ?></div>
+                            <div class="profile-time" style="font-size: 0.85rem; color: var(--lecturer-gray);">
+                                <i class="far fa-clock"></i> <?= date('H:i:s') ?>
+                            </div>
                         </div>
+                        <i class="fas fa-chevron-down profile-caret"></i>
+                    </button>
+                    <div class="lecturer-dropdown">
+                        <a href="../lecturer/notifications.php">
+                            <i class="fas fa-bell"></i> Notifications
+                        </a>
+                        <a href="../lecturer/settings.php">
+                            <i class="fas fa-cog"></i> Settings
+                        </a>
+                        <a href="../logout.php" class="danger-link">
+                            <i class="fas fa-sign-out-alt"></i> Logout
+                        </a>
                     </div>
                 </div>
             </div>
@@ -780,19 +838,13 @@ $today_classes = $stmt->fetchAll();
                         <i class="fas fa-chart-line"></i>
                         <span>Dashboard</span>
                     </li>
-                    <li class="nav-item">
+                    <li class="nav-item" onclick="window.location.href='../lecturer/courses.php'">
                         <i class="fas fa-book-open"></i>
                         <span>My Courses</span>
-                        <span style="margin-left: auto; background: var(--lecturer-accent); color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.8rem;">
-                            <?= $total_courses ?>
-                        </span>
                     </li>
                     <li class="nav-item" onclick="window.location.href='../lecturer/calendar.php'">
                         <i class="fas fa-calendar-alt"></i>
                         <span>Schedule</span>
-                        <span style="margin-left: auto; background: var(--lecturer-accent); color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.8rem;">
-                            <?= $classes_today ?>
-                        </span>
                     </li>
                 </ul>
             </div>
@@ -809,41 +861,20 @@ $today_classes = $stmt->fetchAll();
                         <i class="fas fa-history"></i>
                         <span>Session Records</span>
                     </li>
-                    <li class="nav-item">
+                    <li class="nav-item" onclick="window.location.href='../lecturer/reports.php'">
                         <i class="fas fa-chart-bar"></i>
                         <span>Analytics</span>
                     </li>
                 </ul>
             </div>
             
-            <div class="sidebar-section">
-                <h3>System</h3>
-                <ul class="nav-menu">
-                    <li class="nav-item">
-                        <i class="fas fa-cog"></i>
-                        <span>Settings</span>
-                    </li>
-                    <li class="nav-item">
-                        <i class="fas fa-bell"></i>
-                        <span>Notifications</span>
-                    </li>
-                    <li class="nav-item">
-                        <i class="fas fa-question-circle"></i>
-                        <span>Help</span>
-                    </li>
-                </ul>
-            </div>
-            
-            <a href="../logout.php" class="logout-btn">
-                <i class="fas fa-sign-out-alt"></i> Logout
-            </a>
         </nav>
 
         <!-- MAIN CONTENT -->
         <main class="main-content">
             <!-- WELCOME BANNER -->
             <div class="welcome-banner">
-                <h2>Welcome, <?= htmlspecialchars($_SESSION['name'] ?? 'Professor') ?>!</h2>
+                <h2>Welcome, <?= htmlspecialchars($lecturerName) ?>!</h2>
                 <p>Here's your teaching overview for today. You have <strong><?= $classes_today ?></strong> classes scheduled.</p>
                 
                 <div class="banner-stats">
@@ -852,7 +883,7 @@ $today_classes = $stmt->fetchAll();
                         <span class="label">Students Today</span>
                     </div>
                     <div class="stat-item">
-                        <span class="number"><?= $attendance_rate ?? '85' ?>%</span>
+                        <span class="number"><?= $attendance_rate ?>%</span>
                         <span class="label">Attendance Rate</span>
                     </div>
                     <div class="stat-item">
@@ -900,7 +931,7 @@ $today_classes = $stmt->fetchAll();
                             <i class="fas fa-user-check"></i>
                         </div>
                     </div>
-                    <div class="stat-sub"><?= $attendance_rate ?? '85' ?>% attendance rate</div>
+                    <div class="stat-sub"><?= $attendance_rate ?>% attendance rate</div>
                 </div>
                 
                 <div class="stat-card">
@@ -914,107 +945,6 @@ $today_classes = $stmt->fetchAll();
                         </div>
                     </div>
                     <div class="stat-sub">< 80% attendance</div>
-                </div>
-            </div>
-
-            <!-- TODAY'S CLASSES -->
-            <div class="card">
-                <div class="card-header">
-                    <div class="card-title">
-                        <i class="fas fa-clock"></i> Today's Classes
-                    </div>
-                    <div style="color: var(--lecturer-gray);">
-                        <?= date('l, F j, Y') ?>
-                    </div>
-                </div>
-                
-                <?php if (empty($today_classes)): ?>
-                    <div class="empty-state">
-                        <i class="far fa-calendar-times"></i>
-                        <h3>No classes scheduled for today</h3>
-                        <p>Enjoy your day off or prepare for upcoming classes.</p>
-                    </div>
-                <?php else: ?>
-                    <div class="classes-grid">
-                        <?php foreach ($today_classes as $c): 
-                            $current_time = date('H:i:s');
-                            $class_status = '';
-                            if ($current_time >= $c['start_time'] && $current_time <= $c['end_time']) {
-                                $class_status = 'Ongoing';
-                                $status_color = 'var(--lecturer-success)';
-                            } elseif ($current_time < $c['start_time']) {
-                                $class_status = 'Upcoming';
-                                $status_color = 'var(--lecturer-warning)';
-                            } else {
-                                $class_status = 'Completed';
-                                $status_color = 'var(--lecturer-gray)';
-                            }
-                        ?>
-                            <div class="class-item">
-                                <div class="class-time">
-                                    <span class="start"><?= substr($c['start_time'], 0, 5) ?></span>
-                                    <span class="duration">2h</span>
-                                </div>
-                                <div class="class-info">
-                                    <h4>
-                                        <?= htmlspecialchars($c['course_code']) ?> - 
-                                        <?= htmlspecialchars($c['course_name']) ?>
-                                    </h4>
-                                    <div class="class-details">
-                                        <span><i class="fas fa-map-marker-alt"></i> <?= htmlspecialchars($c['room_name'] ?? 'TBA') ?></span>
-                                        <span><i class="fas fa-user-graduate"></i> 45 Students</span>
-                                        <span style="color: <?= $status_color ?>; font-weight: 600;">
-                                            <i class="fas fa-circle fa-xs"></i> <?= $class_status ?>
-                                        </span>
-                                    </div>
-                                </div>
-                                <div class="class-actions">
-                                    <?php if ($class_status === 'Ongoing' || $class_status === 'Upcoming'): ?>
-                                        <a class="btn btn-primary" 
-                                           href="create_session.php?schedule_id=<?= $c['schedule_id'] ?>">
-                                            <i class="fas fa-play-circle"></i> Create Session
-                                        </a>
-                                    <?php else: ?>
-                                        <a class="btn btn-outline" 
-                                           href="attendance_report.php?schedule_id=<?= $c['schedule_id'] ?>">
-                                            <i class="fas fa-chart-bar"></i> View Report
-                                        </a>
-                                    <?php endif; ?>
-                                </div>
-                            </div>
-                        <?php endforeach; ?>
-                    </div>
-                <?php endif; ?>
-            </div>
-
-            <!-- QUICK ATTENDANCE -->
-            <div class="card quick-attendance">
-                <div class="card-header">
-                    <div class="card-title">
-                        <i class="fas fa-user-check"></i> Quick Attendance Status
-                    </div>
-                    <div style="opacity: 0.8;">
-                        Live Updates
-                    </div>
-                </div>
-                <div class="attendance-summary">
-                    <div class="attendance-stats">
-                        <div class="attendance-stat">
-                            <span class="number"><?= $attendance_rate ?? '85' ?>%</span>
-                            <span class="label">Today's Rate</span>
-                        </div>
-                        <div class="attendance-stat">
-                            <span class="number"><?= $students_today ?></span>
-                            <span class="label">Present Today</span>
-                        </div>
-                        <div class="attendance-stat">
-                            <span class="number"><?= $total_enrolled ?? '200' ?></span>
-                            <span class="label">Total Enrolled</span>
-                        </div>
-                    </div>
-                    <a class="btn btn-success" href="attendance_report.php" style="margin-top: 1rem;">
-                        <i class="fas fa-chart-bar"></i> View Detailed Report
-                    </a>
                 </div>
             </div>
 
@@ -1066,38 +996,42 @@ $today_classes = $stmt->fetchAll();
                     <div class="card-title">
                         <i class="fas fa-history"></i> Recent Activity
                     </div>
-                    <a href="activity.php" style="color: var(--lecturer-primary); text-decoration: none; font-size: 0.9rem;">
+                    <a href="records.php" style="color: var(--lecturer-primary); text-decoration: none; font-size: 0.9rem;">
                         View All →
                     </a>
                 </div>
                 <div class="activity-list">
-                    <div class="class-item" style="background: #f8fafc; border-left: 4px solid var(--lecturer-success);">
-                        <div class="class-info">
-                            <h4>CS101 - Programming Fundamentals</h4>
-                            <div class="class-details">
-                                <span><i class="far fa-clock"></i> 08:30 - 10:30</span>
-                                <span><i class="fas fa-map-marker-alt"></i> LAB 301</span>
-                                <span><i class="fas fa-user-check"></i> 42/45 Present</span>
+                    <?php if (empty($recent_sessions)): ?>
+                        <div class="empty-state">
+                            <i class="far fa-calendar-times"></i>
+                            <h3>No recent sessions</h3>
+                            <p>Create a session to start recording attendance.</p>
+                        </div>
+                    <?php else: ?>
+                        <?php foreach ($recent_sessions as $session): ?>
+                            <?php
+                                $borderColor = $session['session_status'] === 'completed'
+                                    ? 'var(--lecturer-success)'
+                                    : ($session['session_status'] === 'ongoing' ? 'var(--lecturer-warning)' : 'var(--lecturer-accent)');
+                                $presentTotal = (int)$session['total_present'];
+                            ?>
+                            <div class="class-item" style="background: #f8fafc; border-left: 4px solid <?= $borderColor ?>;">
+                                <div class="class-info">
+                                    <h4><?= htmlspecialchars($session['course_code'] . ' - ' . $session['course_name']) ?></h4>
+                                    <div class="class-details">
+                                        <span><i class="far fa-clock"></i> <?= htmlspecialchars(date('d M Y', strtotime($session['session_date']))) ?>, <?= substr($session['planned_start_time'], 0, 5) ?> - <?= substr($session['planned_end_time'], 0, 5) ?></span>
+                                        <span><i class="fas fa-map-marker-alt"></i> <?= htmlspecialchars($session['room_code'] ?: $session['room_name'] ?: 'TBA') ?></span>
+                                        <span><i class="fas fa-user-check"></i> <?= $presentTotal ?>/<?= (int)$session['total_expected'] ?> Present</span>
+                                    </div>
+                                </div>
+                                <div class="class-actions">
+                                    <a class="btn btn-outline" href="records.php?session_id=<?= (int)$session['session_id'] ?>">
+                                        <?= htmlspecialchars(ucfirst($session['session_status'])) ?>
+                                    </a>
+                                </div>
                             </div>
-                        </div>
-                        <div class="class-actions">
-                            <span style="color: var(--lecturer-success); font-weight: 600;">Completed</span>
-                        </div>
-                    </div>
-                    
-                    <div class="class-item" style="background: #fef3c7; border-left: 4px solid var(--lecturer-warning);">
-                        <div class="class-info">
-                            <h4>IT203 - Database Systems</h4>
-                            <div class="class-details">
-                                <span><i class="far fa-clock"></i> 14:00 - 16:00</span>
-                                <span><i class="fas fa-map-marker-alt"></i> Lecture Hall 2</span>
-                                <span><i class="fas fa-exclamation-triangle"></i> 3 at-risk students</span>
-                            </div>
-                        </div>
-                        <div class="class-actions">
-                            <span style="color: var(--lecturer-warning); font-weight: 600;">Ongoing</span>
-                        </div>
-                    </div>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
                 </div>
             </div>
         </main>
@@ -1125,7 +1059,7 @@ $today_classes = $stmt->fetchAll();
                     second: '2-digit'
                 });
                 
-                const dateElement = document.querySelector('.lecturer-profile div div:nth-child(2)');
+                const dateElement = document.querySelector('.profile-time');
                 if (dateElement) {
                     dateElement.innerHTML = `<i class="far fa-clock"></i> ${timeString}`;
                 }

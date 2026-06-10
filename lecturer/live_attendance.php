@@ -2,12 +2,13 @@
 require_once '../includes/auth_check.php';
 requireLecturerOrAdmin();
 require_once '../includes/config.php';
+require_once '../includes/attendance_features.php';
+ensureAttendanceFeatureSchema($pdo);
 
 $userRole = $_SESSION['role'] ?? '';
 $userId = (int)($_SESSION['user_id'] ?? 0);
 $isAdmin = $userRole === 'admin';
 $requestedSessionId = (int)($_GET['session_id'] ?? 0);
-$upcomingSessions = [];
 $canEndSession = false;
 $sessionEndTimestamp = null;
 
@@ -21,8 +22,14 @@ $sessionSql = "
         s.actual_start_time,
         s.actual_end_time,
         s.session_status,
+        s.attendance_method,
+        s.qr_token,
+        s.qr_expires_at,
         cs.course_id,
         cs.lecturer_id,
+        cs.section_name,
+        cs.academic_year,
+        cs.semester_label,
         cs.start_time,
         cs.end_time,
         c.course_code,
@@ -62,48 +69,12 @@ $stmt = $pdo->prepare($sessionSql);
 $stmt->execute($params);
 $activeSession = $stmt->fetch();
 
-$listSql = "
-    SELECT
-        s.session_id,
-        s.session_date,
-        s.planned_start_time,
-        s.planned_end_time,
-        s.session_status,
-        c.course_code,
-        c.course_name,
-        r.room_code,
-        r.room_name
-    FROM attendance_sessions s
-    JOIN class_schedule cs ON s.schedule_id = cs.schedule_id
-    JOIN courses c ON cs.course_id = c.course_id
-    LEFT JOIN rooms r ON cs.room_id = r.room_id
-    WHERE s.session_date BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 3 DAY)
-      AND s.session_status IN ('scheduled', 'ongoing')
-";
-
-$listParams = [];
-if (!$isAdmin) {
-    $listSql .= " AND cs.lecturer_id = ?";
-    $listParams[] = $userId;
-}
-
-$listSql .= "
-    ORDER BY s.session_date ASC,
-             s.planned_start_time ASC,
-             FIELD(s.session_status, 'ongoing', 'scheduled')
-";
-
-$stmt = $pdo->prepare($listSql);
-$stmt->execute($listParams);
-$upcomingSessions = $stmt->fetchAll();
-
 $presentStudents = [];
 $absentStudents = [];
 $allStudents = [];
 $recentScans = [];
 $stats = [
     'present' => 0,
-    'late' => 0,
     'absent' => 0,
     'total' => 0,
     'rate' => 0,
@@ -119,7 +90,15 @@ if ($activeSession) {
         && $activeSession['planned_end_time']
         && time() > $sessionEnd
     ) {
-        markSessionAbsentees($pdo, $sessionId, $courseId, $activeSession['session_date'], $activeSession['planned_end_time']);
+        markSessionAbsentees(
+            $pdo,
+            $sessionId,
+            $courseId,
+            $activeSession['section_name'] ?? 'Section 1',
+            $activeSession['academic_year'] ?? '',
+            $activeSession['session_date'],
+            $activeSession['planned_end_time']
+        );
 
         $stmt = $pdo->prepare("
             SELECT
@@ -131,8 +110,14 @@ if ($activeSession) {
                 s.actual_start_time,
                 s.actual_end_time,
                 s.session_status,
+                s.attendance_method,
+                s.qr_token,
+                s.qr_expires_at,
                 cs.course_id,
                 cs.lecturer_id,
+                cs.section_name,
+                cs.academic_year,
+                cs.semester_label,
                 cs.start_time,
                 cs.end_time,
                 c.course_code,
@@ -155,13 +140,14 @@ if ($activeSession) {
             u.user_id,
             u.full_name,
             u.matric_no,
+            u.profile_image,
             ar.scan_time,
             ar.status,
             ar.late_minutes
         FROM attendance_records ar
         JOIN users u ON ar.student_id = u.user_id
         WHERE ar.session_id = ?
-          AND ar.status IN ('present', 'late')
+          AND ar.status = 'present'
         ORDER BY ar.scan_time DESC
     ");
     $stmt->execute([$sessionId]);
@@ -172,21 +158,33 @@ if ($activeSession) {
             u.user_id,
             u.full_name,
             u.matric_no,
+            u.profile_image,
             ar.scan_time,
             ar.status,
-            ar.late_minutes
+            ar.late_minutes,
+            er.status AS excuse_status
         FROM enrollments e
         JOIN users u ON e.student_id = u.user_id
         LEFT JOIN attendance_records ar
             ON ar.student_id = u.user_id
            AND ar.session_id = ?
+        LEFT JOIN excuse_requests er
+            ON er.record_id = ar.record_id
+           AND er.student_id = u.user_id
         WHERE e.course_id = ?
+          AND e.section_name = ?
+          AND COALESCE(e.academic_year, '') = ?
           AND e.status = 'registered'
           AND u.role = 'student'
           AND u.is_active = 1
         ORDER BY u.full_name
     ");
-    $stmt->execute([$sessionId, $courseId]);
+    $stmt->execute([
+        $sessionId,
+        $courseId,
+        $activeSession['section_name'] ?? 'Section 1',
+        $activeSession['academic_year'] ?? ''
+    ]);
     $allStudents = $stmt->fetchAll();
 
     foreach ($allStudents as $student) {
@@ -197,8 +195,10 @@ if ($activeSession) {
 
     $stmt = $pdo->prepare("
         SELECT
+            ar.record_id,
             u.full_name,
             u.matric_no,
+            u.profile_image,
             ar.scan_time,
             ar.status,
             ar.late_minutes
@@ -213,7 +213,6 @@ if ($activeSession) {
 
     $stats['total'] = count($allStudents);
     $stats['present'] = count(array_filter($presentStudents, fn($s) => $s['status'] === 'present'));
-    $stats['late'] = count(array_filter($presentStudents, fn($s) => $s['status'] === 'late'));
     $stats['absent'] = count($absentStudents);
     $stats['rate'] = $stats['total'] > 0 ? round((count($presentStudents) / $stats['total']) * 100) : 0;
 
@@ -224,7 +223,7 @@ if ($activeSession) {
         && time() >= $sessionEndTimestamp;
 }
 
-function markSessionAbsentees(PDO $pdo, int $sessionId, int $courseId, string $sessionDate, string $plannedEndTime): void {
+function markSessionAbsentees(PDO $pdo, int $sessionId, int $courseId, string $sectionName, string $academicYear, string $sessionDate, string $plannedEndTime): void {
     $pdo->beginTransaction();
 
     try {
@@ -245,6 +244,8 @@ function markSessionAbsentees(PDO $pdo, int $sessionId, int $courseId, string $s
             FROM enrollments e
             JOIN users u ON e.student_id = u.user_id
             WHERE e.course_id = ?
+              AND e.section_name = ?
+              AND COALESCE(e.academic_year, '') = ?
               AND e.status = 'registered'
               AND u.role = 'student'
               AND u.is_active = 1
@@ -255,7 +256,7 @@ function markSessionAbsentees(PDO $pdo, int $sessionId, int $courseId, string $s
                     AND ar.student_id = e.student_id
               )
         ");
-        $stmt->execute([$sessionId, $absentScanTime, $courseId, $sessionId]);
+        $stmt->execute([$sessionId, $absentScanTime, $courseId, $sectionName, $academicYear, $sessionId]);
 
         $stmt = $pdo->prepare("
             UPDATE attendance_sessions
@@ -268,12 +269,7 @@ function markSessionAbsentees(PDO $pdo, int $sessionId, int $courseId, string $s
                     WHERE session_id = ?
                       AND status = 'present'
                 ),
-                total_late = (
-                    SELECT COUNT(*)
-                    FROM attendance_records
-                    WHERE session_id = ?
-                      AND status = 'late'
-                ),
+                total_late = 0,
                 total_absent = (
                     SELECT COUNT(*)
                     FROM attendance_records
@@ -282,7 +278,7 @@ function markSessionAbsentees(PDO $pdo, int $sessionId, int $courseId, string $s
                 )
             WHERE session_id = ?
         ");
-        $stmt->execute([$sessionId, $sessionId, $sessionId, $sessionId]);
+        $stmt->execute([$sessionId, $sessionId, $sessionId]);
 
         $pdo->commit();
     } catch (Throwable $e) {
@@ -421,83 +417,6 @@ function formatTime($value) {
             margin-bottom: 20px;
         }
 
-        .session-list {
-            display: grid;
-            gap: 10px;
-            margin-bottom: 0;
-        }
-
-        .session-list-card {
-            padding: 18px;
-            margin-bottom: 20px;
-            background: #ffffff;
-            border: 1px solid #e2e8f0;
-            border-radius: 8px;
-            box-shadow: 0 10px 22px rgba(15, 23, 42, 0.06);
-        }
-
-        .session-list-header {
-            display: flex;
-            align-items: flex-end;
-            justify-content: space-between;
-            gap: 14px;
-            margin-bottom: 8px;
-        }
-
-        .session-list-title {
-            color: #111827;
-            font-size: 15px;
-            font-weight: 800;
-        }
-
-        .session-list-note {
-            color: #64748b;
-            font-size: 13px;
-        }
-
-        .session-row {
-            display: grid;
-            grid-template-columns: 1fr auto;
-            gap: 14px;
-            align-items: center;
-            padding: 14px 16px;
-            background: #f8fafc;
-            border: 1px solid #e2e8f0;
-            border-radius: 8px;
-            text-decoration: none;
-            color: inherit;
-        }
-
-        .session-row.active-row {
-            background: #ffffff;
-            border-color: #2563eb;
-            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
-        }
-
-        .session-row-kicker {
-            display: inline-flex;
-            align-items: center;
-            margin-bottom: 6px;
-            color: #2563eb;
-            font-size: 12px;
-            font-weight: 800;
-            text-transform: uppercase;
-        }
-
-        .session-row-title {
-            font-weight: 750;
-            color: #111827;
-        }
-
-        .session-row-meta {
-            display: flex;
-            gap: 14px;
-            flex-wrap: wrap;
-            margin-top: 5px;
-            color: #64748b;
-            font-size: 13px;
-        }
-
         .session-title {
             font-size: 20px;
             font-weight: 750;
@@ -552,7 +471,7 @@ function formatTime($value) {
 
         .stats {
             display: grid;
-            grid-template-columns: repeat(4, minmax(0, 1fr));
+            grid-template-columns: repeat(3, minmax(0, 1fr));
             gap: 14px;
             margin-bottom: 20px;
         }
@@ -630,6 +549,212 @@ function formatTime($value) {
             color: #111827;
         }
 
+        .student-cell {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .student-photo {
+            width: 42px;
+            height: 42px;
+            border-radius: 50%;
+            object-fit: cover;
+            border: 2px solid #e2e8f0;
+            flex: 0 0 auto;
+        }
+
+        .qr-box {
+            grid-column: 1 / -1;
+            width: min(620px, 100%);
+            margin: 18px auto 0;
+            padding: 22px;
+            border: 1px solid #bfdbfe;
+            border-radius: 18px;
+            background:
+                linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(240, 253, 250, 0.95));
+            display: grid;
+            justify-items: center;
+            align-items: center;
+            gap: 14px;
+            text-align: center;
+            box-shadow: 0 18px 42px rgba(37, 99, 235, 0.12);
+        }
+
+        .qr-box img {
+            width: 220px;
+            height: 220px;
+            border-radius: 18px;
+            background: #fff;
+            padding: 12px;
+            border: 1px solid #dbeafe;
+            box-shadow: 0 12px 28px rgba(15, 23, 42, 0.12);
+        }
+
+        .qr-title {
+            font-size: 18px;
+            font-weight: 900;
+            color: #0f172a;
+        }
+
+        .qr-help {
+            max-width: 480px;
+            color: #64748b;
+            font-size: 14px;
+            font-weight: 650;
+        }
+
+        .qr-link {
+            max-width: 100%;
+            word-break: break-all;
+            color: #1d4ed8;
+            font-size: 12px;
+            font-weight: 700;
+            margin-top: 2px;
+            padding: 9px 12px;
+            border-radius: 999px;
+            background: #eff6ff;
+            border: 1px solid #bfdbfe;
+        }
+
+        .session-main {
+            display: contents;
+        }
+
+        .session-info {
+            min-width: 0;
+        }
+
+        .scan-modal {
+            position: fixed;
+            inset: 0;
+            z-index: 1000;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            background: rgba(15, 23, 42, 0.48);
+            backdrop-filter: blur(3px);
+        }
+
+        .scan-modal.show {
+            display: flex;
+        }
+
+        .scan-card {
+            width: min(780px, 100%);
+            display: grid;
+            grid-template-columns: 0.9fr 1fr;
+            gap: 22px;
+            background: linear-gradient(145deg, #ffffff, #f8fff9);
+            border: 2px solid #86efac;
+            border-radius: 22px;
+            box-shadow: 0 28px 70px rgba(15, 23, 42, 0.28);
+            padding: 20px;
+            position: relative;
+        }
+
+        .scan-close {
+            position: absolute;
+            top: 12px;
+            right: 14px;
+            width: 34px;
+            height: 34px;
+            border: 0;
+            border-radius: 50%;
+            background: #eef2ff;
+            color: #334155;
+            font-weight: 800;
+            cursor: pointer;
+        }
+
+        .scan-photo {
+            width: 100%;
+            aspect-ratio: 4 / 5;
+            object-fit: cover;
+            border-radius: 18px;
+            border: 3px solid #86efac;
+            box-shadow: 0 14px 30px rgba(22, 163, 74, 0.18);
+        }
+
+        .scan-success {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            margin-bottom: 18px;
+            color: #15803d;
+            font-weight: 900;
+            text-transform: uppercase;
+        }
+
+        .scan-success-icon {
+            width: 54px;
+            height: 54px;
+            display: grid;
+            place-items: center;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #22c55e, #16a34a);
+            color: #fff;
+            font-size: 30px;
+        }
+
+        .scan-name {
+            font-size: clamp(34px, 6vw, 58px);
+            line-height: 1;
+            color: #111827;
+            margin-bottom: 8px;
+        }
+
+        .scan-matric {
+            color: #4f46e5;
+            font-size: 22px;
+            font-weight: 800;
+            margin-bottom: 18px;
+        }
+
+        .scan-detail {
+            display: grid;
+            grid-template-columns: 120px 1fr;
+            gap: 8px;
+            padding: 11px 0;
+            border-bottom: 1px solid #e2e8f0;
+            color: #334155;
+            font-size: 14px;
+        }
+
+        .scan-detail span:first-child {
+            color: #64748b;
+            font-weight: 700;
+        }
+
+        .scan-footer {
+            margin-top: 18px;
+            padding: 16px;
+            border-radius: 14px;
+            background: #ecfdf3;
+            color: #166534;
+            font-weight: 700;
+        }
+
+        @media (max-width: 720px) {
+            .qr-box {
+                padding: 18px;
+            }
+
+            .qr-box img {
+                width: 190px;
+                height: 190px;
+            }
+
+            .scan-card {
+                grid-template-columns: 1fr;
+            }
+
+            .scan-photo {
+                max-height: 360px;
+            }
+        }
+
         .empty {
             padding: 28px 18px;
             color: #64748b;
@@ -664,8 +789,7 @@ function formatTime($value) {
             }
 
             .topbar,
-            .session,
-            .session-row {
+            .session {
                 grid-template-columns: 1fr;
             }
 
@@ -689,6 +813,9 @@ function formatTime($value) {
             }
         }
     </style>
+    <link rel="stylesheet" href="../assets/css/lecturer-theme.css">
+    <link rel="stylesheet" href="../assets/css/app-polish.css">
+    <link rel="stylesheet" href="../assets/css/lecturer-polish.css">
 </head>
 <body>
     <main class="page">
@@ -728,43 +855,9 @@ function formatTime($value) {
                 </div>
             </section>
         <?php else: ?>
-            <section class="session-list-card">
-                <div class="session-list-header">
-                    <div>
-                        <div class="session-list-title">Upcoming Attendance Sessions</div>
-                        <div class="session-list-note">Next 3 days. Select a session to view or manage its attendance.</div>
-                    </div>
-                </div>
-
-                <div class="session-list">
-                    <?php foreach ($upcomingSessions as $sessionOption): ?>
-                        <a
-                            class="session-row <?= (int)$sessionOption['session_id'] === (int)$activeSession['session_id'] ? 'active-row' : '' ?>"
-                            href="live_attendance.php?session_id=<?= e($sessionOption['session_id']) ?>"
-                        >
-                            <div>
-                                <?php if ((int)$sessionOption['session_id'] === (int)$activeSession['session_id']): ?>
-                                    <div class="session-row-kicker">
-                                        <?= $sessionOption['session_status'] === 'ongoing' ? 'Currently Active Session' : 'Next Scheduled Session' ?>
-                                    </div>
-                                <?php endif; ?>
-                                <div class="session-row-title">
-                                    <?= e($sessionOption['course_code']) ?> - <?= e($sessionOption['course_name']) ?>
-                                </div>
-                                <div class="session-row-meta">
-                                    <span><?= e(date('D, d M Y', strtotime($sessionOption['session_date']))) ?></span>
-                                    <span><?= e(substr($sessionOption['planned_start_time'], 0, 5)) ?> - <?= e(substr($sessionOption['planned_end_time'], 0, 5)) ?></span>
-                                    <span><?= e($sessionOption['room_code'] ?: $sessionOption['room_name'] ?: 'Not assigned') ?></span>
-                                </div>
-                            </div>
-                            <span class="badge"><?= e($sessionOption['session_status']) ?></span>
-                        </a>
-                    <?php endforeach; ?>
-                </div>
-            </section>
-
             <section class="panel session">
-                <div>
+                <div class="session-main">
+                    <div class="session-info">
                     <div class="section-label">Selected Session Details</div>
                     <div class="session-title">
                         <?= e($activeSession['course_code']) ?> - <?= e($activeSession['course_name']) ?>
@@ -773,8 +866,29 @@ function formatTime($value) {
                         <span>Date: <?= e($activeSession['session_date']) ?></span>
                         <span>Time: <?= e(substr($activeSession['planned_start_time'] ?: $activeSession['start_time'], 0, 5)) ?> - <?= e(substr($activeSession['planned_end_time'] ?: $activeSession['end_time'], 0, 5)) ?></span>
                         <span>Room: <?= e($activeSession['room_code'] ?: $activeSession['room_name'] ?: 'Not assigned') ?></span>
+                        <span>Method: <?= e(strtoupper($activeSession['attendance_method'] ?? 'rfid')) ?></span>
                         <span>Started: <?= e(formatTime($activeSession['actual_start_time'])) ?></span>
                     </div>
+                    </div>
+                    <?php if (in_array($activeSession['attendance_method'] ?? 'rfid', ['qr', 'both'], true) && !empty($activeSession['qr_token'])): ?>
+                        <?php
+                            $qrBaseUrl = defined('SITE_URL') ? rtrim(SITE_URL, '/') : '';
+                            if ($qrBaseUrl === '') {
+                                $qrBaseUrl = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https' : 'http')
+                                    . '://' . $_SERVER['HTTP_HOST']
+                                    . dirname(dirname($_SERVER['SCRIPT_NAME']));
+                            }
+                            $qrUrl = $qrBaseUrl . '/student/scan_qr.php?token=' . urlencode($activeSession['qr_token']);
+                        ?>
+                        <div class="qr-box">
+                            <img alt="Session QR Code" src="https://api.qrserver.com/v1/create-qr-code/?size=320x320&data=<?= urlencode($qrUrl) ?>">
+                            <div>
+                                <div class="qr-title">QR Attendance Link</div>
+                                <div class="qr-help">Students can scan this QR for online/hybrid attendance until session end time.</div>
+                                <div class="qr-link"><?= e($qrUrl) ?></div>
+                            </div>
+                        </div>
+                    <?php endif; ?>
                 </div>
                 <div>
                     <span class="badge"><?= e($activeSession['session_status']) ?></span>
@@ -801,10 +915,6 @@ function formatTime($value) {
                 <div class="stat">
                     <div class="stat-value"><?= e($stats['present']) ?></div>
                     <div class="stat-label">Present</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-value"><?= e($stats['late']) ?></div>
-                    <div class="stat-label">Late</div>
                 </div>
                 <div class="stat">
                     <div class="stat-value"><?= e($stats['absent']) ?></div>
@@ -839,12 +949,15 @@ function formatTime($value) {
                                 <?php foreach ($presentStudents as $student): ?>
                                     <tr>
                                         <td>
-                                            <div class="student"><?= e($student['full_name']) ?></div>
+                                            <div class="student-cell">
+                                                <img class="student-photo" src="<?= e(profileImageUrl($student['profile_image'] ?? '', $student['full_name'])) ?>" alt="<?= e($student['full_name']) ?>">
+                                                <div class="student"><?= e($student['full_name']) ?></div>
+                                            </div>
                                         </td>
                                         <td><?= e($student['matric_no']) ?></td>
                                         <td><?= e(formatTime($student['scan_time'])) ?></td>
                                         <td>
-                                            <span class="badge <?= $student['status'] === 'late' ? 'badge-late' : 'badge-present' ?>">
+                                            <span class="badge badge-present">
                                                 <?= e($student['status']) ?>
                                             </span>
                                         </td>
@@ -872,11 +985,16 @@ function formatTime($value) {
                         <div class="list">
                             <?php foreach ($absentStudents as $student): ?>
                                 <div class="list-row">
-                                    <div>
-                                        <div class="student"><?= e($student['full_name']) ?></div>
-                                        <div class="muted small"><?= e($student['matric_no']) ?></div>
+                                    <div class="student-cell">
+                                        <img class="student-photo" src="<?= e(profileImageUrl($student['profile_image'] ?? '', $student['full_name'])) ?>" alt="<?= e($student['full_name']) ?>">
+                                        <div>
+                                            <div class="student"><?= e($student['full_name']) ?></div>
+                                            <div class="muted small"><?= e($student['matric_no']) ?></div>
+                                        </div>
                                     </div>
-                                    <span class="badge badge-absent">Absent</span>
+                                    <div class="actions">
+                                        <span class="badge badge-absent">Absent</span>
+                                    </div>
                                 </div>
                             <?php endforeach; ?>
                         </div>
@@ -900,21 +1018,24 @@ function formatTime($value) {
                                 <th>Student</th>
                                 <th>Matric No</th>
                                 <th>Status</th>
-                                <th>Late Minutes</th>
                             </tr>
                         </thead>
                         <tbody>
                             <?php foreach ($recentScans as $scan): ?>
                                 <tr>
                                     <td><?= e(formatTime($scan['scan_time'])) ?></td>
-                                    <td><?= e($scan['full_name']) ?></td>
+                                    <td>
+                                        <div class="student-cell">
+                                            <img class="student-photo" src="<?= e(profileImageUrl($scan['profile_image'] ?? '', $scan['full_name'])) ?>" alt="<?= e($scan['full_name']) ?>">
+                                            <div><?= e($scan['full_name']) ?></div>
+                                        </div>
+                                    </td>
                                     <td><?= e($scan['matric_no']) ?></td>
                                     <td>
-                                        <span class="badge <?= $scan['status'] === 'absent' ? 'badge-absent' : ($scan['status'] === 'late' ? 'badge-late' : 'badge-present') ?>">
+                                        <span class="badge <?= $scan['status'] === 'absent' ? 'badge-absent' : 'badge-present' ?>">
                                             <?= e($scan['status']) ?>
                                         </span>
                                     </td>
-                                    <td><?= e((int)$scan['late_minutes']) ?></td>
                                 </tr>
                             <?php endforeach; ?>
                         </tbody>
@@ -924,6 +1045,52 @@ function formatTime($value) {
         <?php endif; ?>
     </main>
 
+    <?php
+        $latestScan = $recentScans[0] ?? null;
+        $shouldShowScanModal = $activeSession
+            && $latestScan
+            && $latestScan['status'] === 'present'
+            && strtotime($latestScan['scan_time']) >= time() - 30;
+    ?>
+    <?php if ($shouldShowScanModal): ?>
+        <div class="scan-modal" id="scanSuccessModal" data-record-id="<?= e($latestScan['record_id']) ?>">
+            <div class="scan-card">
+                <button class="scan-close" type="button" onclick="closeScanModal()">&times;</button>
+                <img class="scan-photo" src="<?= e(profileImageUrl($latestScan['profile_image'] ?? '', $latestScan['full_name'])) ?>" alt="<?= e($latestScan['full_name']) ?>">
+                <div>
+                    <div class="scan-success">
+                        <div class="scan-success-icon">✓</div>
+                        <div>
+                            <div>Scan Successful</div>
+                            <div style="font-size: 13px; text-transform: none; font-weight: 700;">Attendance recorded</div>
+                        </div>
+                    </div>
+                    <div class="scan-name"><?= e($latestScan['full_name']) ?></div>
+                    <div class="scan-matric"><?= e($latestScan['matric_no']) ?></div>
+                    <div class="scan-detail">
+                        <span>Course</span>
+                        <strong><?= e($activeSession['course_code']) ?> - <?= e($activeSession['course_name']) ?></strong>
+                    </div>
+                    <div class="scan-detail">
+                        <span>Scan Time</span>
+                        <strong><?= e(formatTime($latestScan['scan_time'])) ?></strong>
+                    </div>
+                    <div class="scan-detail">
+                        <span>Date</span>
+                        <strong><?= e(date('d M Y', strtotime($latestScan['scan_time']))) ?></strong>
+                    </div>
+                    <div class="scan-detail">
+                        <span>Status</span>
+                        <strong><span class="badge badge-present"><?= e($latestScan['status']) ?></span></strong>
+                    </div>
+                    <div class="scan-footer">
+                        Attendance recorded successfully.
+                    </div>
+                </div>
+            </div>
+        </div>
+    <?php endif; ?>
+
     <?php if ($activeSession && in_array($activeSession['session_status'], ['scheduled', 'ongoing'], true)): ?>
         <script>
             setInterval(() => {
@@ -931,5 +1098,23 @@ function formatTime($value) {
             }, 7000);
         </script>
     <?php endif; ?>
+    <script>
+        const scanModal = document.getElementById('scanSuccessModal');
+        if (scanModal) {
+            const recordKey = `scan_success_seen_${scanModal.dataset.recordId}`;
+            if (!localStorage.getItem(recordKey)) {
+                scanModal.classList.add('show');
+                localStorage.setItem(recordKey, '1');
+                setTimeout(closeScanModal, 6500);
+            }
+        }
+
+        function closeScanModal() {
+            const modal = document.getElementById('scanSuccessModal');
+            if (modal) {
+                modal.classList.remove('show');
+            }
+        }
+    </script>
 </body>
 </html>

@@ -11,9 +11,9 @@ $admin_count = $stmt->fetch()['count'];
 if ($admin_count > 0) {
     echo "<div style='color: orange; padding: 15px; background: #fff3e0; border: 2px solid #ff9800; border-radius: 5px;'>
           <strong>⚠ Admin user already exists!</strong><br>
-          You can reset the password instead.</div>";
+          Please login with the existing admin account or update the password from the database/admin panel.</div>";
     
-    echo '<a href="reset_password.php" style="display: inline-block; padding: 10px 20px; background: #ff9800; color: white; text-decoration: none; border-radius: 5px; margin: 10px 0;">Reset Admin Password</a><br>';
+    echo '<a href="login.php" style="display: inline-block; padding: 10px 20px; background: #006837; color: white; text-decoration: none; border-radius: 5px; margin: 10px 0;">Go to Login Page</a><br>';
 }
 
 // Create admin

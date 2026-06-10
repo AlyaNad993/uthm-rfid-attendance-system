@@ -1,3 +1,413 @@
+<?php
+require_once '../includes/auth_check.php';
+requireAdmin();
+require_once '../includes/config.php';
+require_once '../includes/attendance_features.php';
+ensureAttendanceFeatureSchema($pdo);
+
+function adminUsersJsonResponse($ok, $message, $extra = []) {
+    header('Content-Type: application/json');
+    echo json_encode(array_merge([
+        'ok' => $ok,
+        'message' => $message
+    ], $extra));
+    exit();
+}
+
+function adminUsersValidPhone(string $phone): bool {
+    return $phone === '' || (bool)preg_match('/^\+?[0-9\s\-]{7,20}$/', $phone);
+}
+
+function adminUsersValidRfidUid(string $uid): bool {
+    return (bool)preg_match('/^[A-F0-9]{4,32}$/', $uid);
+}
+
+function saveUserProfileImage(int $userId): ?string {
+    if (empty($_FILES['profile_image']['name']) || $_FILES['profile_image']['error'] === UPLOAD_ERR_NO_FILE) {
+        return null;
+    }
+
+    if ($_FILES['profile_image']['error'] !== UPLOAD_ERR_OK) {
+        adminUsersJsonResponse(false, 'Unable to upload profile image.');
+    }
+
+    $allowedTypes = [
+        'image/jpeg' => 'jpg',
+        'image/png' => 'png',
+        'image/webp' => 'webp'
+    ];
+    $mimeType = mime_content_type($_FILES['profile_image']['tmp_name']);
+
+    if (!isset($allowedTypes[$mimeType])) {
+        adminUsersJsonResponse(false, 'Only JPG, PNG, or WEBP images are allowed.');
+    }
+
+    if ($_FILES['profile_image']['size'] > 2 * 1024 * 1024) {
+        adminUsersJsonResponse(false, 'Profile image must be 2MB or smaller.');
+    }
+
+    $uploadDir = __DIR__ . '/../uploads/profile_images';
+    if (!is_dir($uploadDir)) {
+        mkdir($uploadDir, 0775, true);
+    }
+
+    $fileName = 'user_' . $userId . '_' . time() . '.' . $allowedTypes[$mimeType];
+    $targetPath = $uploadDir . '/' . $fileName;
+
+    if (!move_uploaded_file($_FILES['profile_image']['tmp_name'], $targetPath)) {
+        adminUsersJsonResponse(false, 'Unable to save profile image.');
+    }
+
+    return 'uploads/profile_images/' . $fileName;
+}
+
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
+    $action = $_POST['action'] ?? '';
+
+    try {
+        if ($action === 'add_user') {
+            $matricNo = trim($_POST['matric_no'] ?? '');
+            $fullName = trim($_POST['full_name'] ?? '');
+            $email = trim($_POST['email'] ?? '');
+            $phone = trim($_POST['phone'] ?? '');
+            $department = trim($_POST['department'] ?? '');
+            $role = trim($_POST['role'] ?? 'student');
+
+            if ($matricNo === '' || $fullName === '' || $email === '') {
+                adminUsersJsonResponse(false, 'Please fill in ID, name and email.');
+            }
+
+            if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                adminUsersJsonResponse(false, 'Please enter a valid email address.');
+            }
+
+            if (!adminUsersValidPhone($phone)) {
+                adminUsersJsonResponse(false, 'Please enter a valid phone number.');
+            }
+
+            if (!in_array($role, ['student', 'lecturer', 'staff', 'admin'], true)) {
+                adminUsersJsonResponse(false, 'Invalid user role.');
+            }
+
+            $stmt = $pdo->prepare("
+                INSERT INTO users
+                    (matric_no, full_name, email, phone, password_hash, role, department, faculty, is_active)
+                VALUES
+                    (?, ?, ?, ?, ?, ?, ?, 'OTHER', 1)
+            ");
+            $stmt->execute([
+                $matricNo,
+                $fullName,
+                $email,
+                $phone,
+                password_hash('password123', PASSWORD_DEFAULT),
+                $role,
+                $department
+            ]);
+
+            $newUserId = (string)$pdo->lastInsertId();
+            adminUsersJsonResponse(true, 'User added successfully.', [
+                'user' => [
+                    'id' => $newUserId,
+                    'matric' => $matricNo,
+                    'name' => $fullName,
+                    'role' => $role,
+                    'rfid' => '',
+                    'status' => 'active',
+                    'email' => $email,
+                    'phone' => $phone,
+                    'dept' => $department,
+                    'profileImage' => '',
+                    'cardStatus' => '',
+                    'studentStats' => [
+                        'courseCount' => 0,
+                        'attendanceRate' => 0,
+                        'attendanceRecords' => 0,
+                        'warningCount' => 0,
+                        'excuseCount' => 0
+                    ],
+                    'lecturerStats' => [
+                        'courseCount' => 0,
+                        'scheduleCount' => 0,
+                        'sessionCount' => 0,
+                        'studentCount' => 0
+                    ]
+                ]
+            ]);
+        }
+
+        if ($action === 'assign_rfid') {
+            $userId = (int)($_POST['user_id'] ?? 0);
+            $uid = strtoupper(trim($_POST['uid'] ?? ''));
+            $status = trim($_POST['status'] ?? 'active');
+
+            if ($userId <= 0 || $uid === '') {
+                adminUsersJsonResponse(false, 'Please select a user and enter RFID UID.');
+            }
+
+            if (!adminUsersValidRfidUid($uid)) {
+                adminUsersJsonResponse(false, 'RFID UID must contain 4 to 32 hexadecimal characters.');
+            }
+
+            if (!in_array($status, ['active', 'inactive', 'lost', 'damaged', 'expired'], true)) {
+                adminUsersJsonResponse(false, 'Invalid card status.');
+            }
+
+            $userStmt = $pdo->prepare("SELECT user_id, role FROM users WHERE user_id = ?");
+            $userStmt->execute([$userId]);
+            $user = $userStmt->fetch();
+
+            if (!$user) {
+                adminUsersJsonResponse(false, 'Selected user does not exist.');
+            }
+
+            $cardType = in_array($user['role'], ['student', 'lecturer', 'staff'], true) ? $user['role'] : 'staff';
+            $cardId = 'CARD' . date('YmdHis') . random_int(10, 99);
+            $registeredBy = $_SESSION['user_id'] ?? null;
+
+            $stmt = $pdo->prepare("
+                INSERT INTO rfid_cards
+                    (card_id, user_id, uid, card_type, issue_date, status, registered_by)
+                VALUES
+                    (?, ?, ?, ?, CURDATE(), ?, ?)
+            ");
+            $stmt->execute([$cardId, $userId, $uid, $cardType, $status, $registeredBy]);
+
+            adminUsersJsonResponse(true, 'RFID card assigned successfully.');
+        }
+
+        if ($action === 'update_user') {
+            $userId = (int)($_POST['user_id'] ?? 0);
+            $fullName = trim($_POST['full_name'] ?? '');
+            $email = trim($_POST['email'] ?? '');
+            $phone = trim($_POST['phone'] ?? '');
+            $department = trim($_POST['department'] ?? '');
+            $role = trim($_POST['role'] ?? 'student');
+            $status = trim($_POST['status'] ?? 'active');
+
+            if ($userId <= 0 || $fullName === '' || $email === '') {
+                adminUsersJsonResponse(false, 'Please fill in name and email.');
+            }
+
+            if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                adminUsersJsonResponse(false, 'Please enter a valid email address.');
+            }
+
+            if (!adminUsersValidPhone($phone)) {
+                adminUsersJsonResponse(false, 'Please enter a valid phone number.');
+            }
+
+            if (!in_array($role, ['student', 'lecturer', 'staff', 'admin'], true)) {
+                adminUsersJsonResponse(false, 'Invalid user role.');
+            }
+
+            $isActive = $status === 'active' ? 1 : 0;
+            $profileImage = saveUserProfileImage($userId);
+
+            if ($profileImage) {
+                $stmt = $pdo->prepare("
+                    UPDATE users
+                    SET full_name = ?, email = ?, phone = ?, role = ?, department = ?, is_active = ?, profile_image = ?
+                    WHERE user_id = ?
+                ");
+                $stmt->execute([$fullName, $email, $phone, $role, $department, $isActive, $profileImage, $userId]);
+            } else {
+                $stmt = $pdo->prepare("
+                    UPDATE users
+                    SET full_name = ?, email = ?, phone = ?, role = ?, department = ?, is_active = ?
+                    WHERE user_id = ?
+                ");
+                $stmt->execute([$fullName, $email, $phone, $role, $department, $isActive, $userId]);
+            }
+
+            adminUsersJsonResponse(true, 'User updated successfully.', [
+                'profile_image' => $profileImage
+            ]);
+        }
+
+        if ($action === 'delete_user') {
+            $userId = (int)($_POST['user_id'] ?? 0);
+
+            if ($userId <= 0) {
+                adminUsersJsonResponse(false, 'Invalid user selected.');
+            }
+
+            if ($userId === (int)($_SESSION['user_id'] ?? 0)) {
+                adminUsersJsonResponse(false, 'You cannot delete your own admin account.');
+            }
+
+            $userStmt = $pdo->prepare("SELECT user_id, role FROM users WHERE user_id = ? LIMIT 1");
+            $userStmt->execute([$userId]);
+            $user = $userStmt->fetch();
+
+            if (!$user) {
+                adminUsersJsonResponse(false, 'User was not found.');
+            }
+
+            if (!in_array($user['role'], ['student', 'lecturer'], true)) {
+                adminUsersJsonResponse(false, 'Only student and lecturer accounts can be deleted here.');
+            }
+
+            $pdo->beginTransaction();
+
+            $stmt = $pdo->prepare("UPDATE users SET is_active = 0 WHERE user_id = ?");
+            $stmt->execute([$userId]);
+
+            $stmt = $pdo->prepare("UPDATE rfid_cards SET status = 'inactive' WHERE user_id = ?");
+            $stmt->execute([$userId]);
+
+            $pdo->commit();
+
+            adminUsersJsonResponse(true, 'User deleted successfully. Existing attendance records were kept for reports.');
+        }
+
+        adminUsersJsonResponse(false, 'Unknown action.');
+    } catch (PDOException $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+
+        if ($e->getCode() === '23000') {
+            adminUsersJsonResponse(false, 'This ID, email or RFID UID already exists.');
+        }
+
+        adminUsersJsonResponse(false, 'Database error: ' . $e->getMessage());
+    }
+}
+
+$usersStmt = $pdo->query("
+    SELECT
+        u.user_id,
+        u.matric_no,
+        u.full_name,
+        u.role,
+        u.email,
+        u.phone,
+        u.department,
+        u.profile_image,
+        u.is_active,
+        rc.uid AS rfid_uid,
+        rc.status AS card_status
+    FROM users u
+    LEFT JOIN rfid_cards rc
+        ON rc.card_id = (
+            SELECT rc2.card_id
+            FROM rfid_cards rc2
+            WHERE rc2.user_id = u.user_id
+            ORDER BY rc2.issue_date DESC, rc2.card_id DESC
+            LIMIT 1
+        )
+    WHERE u.is_active = 1
+    ORDER BY u.created_at DESC, u.user_id DESC
+");
+
+$usersRows = $usersStmt->fetchAll();
+
+$studentStatsRows = $pdo->query("
+    SELECT
+        u.user_id,
+        COUNT(DISTINCT e.course_id) AS course_count,
+        COUNT(DISTINCT ar.record_id) AS attendance_records,
+        COUNT(DISTINCT CASE WHEN ar.status = 'present' THEN ar.record_id END) AS attended_records,
+        COUNT(DISTINCT wl.letter_id) AS warning_count,
+        COUNT(DISTINCT er.excuse_id) AS excuse_count
+    FROM users u
+    LEFT JOIN enrollments e
+        ON e.student_id = u.user_id
+       AND e.status = 'registered'
+    LEFT JOIN attendance_records ar
+        ON ar.student_id = u.user_id
+       AND ar.status IN ('present', 'late', 'absent')
+    LEFT JOIN warning_letters wl
+        ON wl.student_id = u.user_id
+       AND wl.status = 'issued'
+    LEFT JOIN excuse_requests er
+        ON er.student_id = u.user_id
+    WHERE u.role = 'student'
+    GROUP BY u.user_id
+")->fetchAll();
+
+$studentStats = [];
+foreach ($studentStatsRows as $row) {
+    $total = (int)$row['attendance_records'];
+    $attended = (int)$row['attended_records'];
+    $studentStats[(int)$row['user_id']] = [
+        'courseCount' => (int)$row['course_count'],
+        'attendanceRate' => $total > 0 ? round(($attended / $total) * 100) : 0,
+        'attendanceRecords' => $total,
+        'warningCount' => (int)$row['warning_count'],
+        'excuseCount' => (int)$row['excuse_count']
+    ];
+}
+
+$lecturerStatsRows = $pdo->query("
+    SELECT
+        u.user_id,
+        COUNT(DISTINCT cs.course_id) AS course_count,
+        COUNT(DISTINCT cs.schedule_id) AS schedule_count,
+        COUNT(DISTINCT ats.session_id) AS session_count,
+        COUNT(DISTINCT e.student_id) AS student_count
+    FROM users u
+    LEFT JOIN class_schedule cs
+        ON cs.lecturer_id = u.user_id
+       AND cs.is_active = 1
+    LEFT JOIN attendance_sessions ats
+        ON ats.schedule_id = cs.schedule_id
+    LEFT JOIN enrollments e
+        ON e.course_id = cs.course_id
+       AND e.status = 'registered'
+    WHERE u.role = 'lecturer'
+    GROUP BY u.user_id
+")->fetchAll();
+
+$lecturerStats = [];
+foreach ($lecturerStatsRows as $row) {
+    $lecturerStats[(int)$row['user_id']] = [
+        'courseCount' => (int)$row['course_count'],
+        'scheduleCount' => (int)$row['schedule_count'],
+        'sessionCount' => (int)$row['session_count'],
+        'studentCount' => (int)$row['student_count']
+    ];
+}
+
+$usersData = array_map(function ($row) {
+    global $studentStats, $lecturerStats;
+
+    $status = $row['is_active'] ? 'active' : 'inactive';
+    $userId = (int)$row['user_id'];
+
+    if (!empty($row['rfid_uid']) && !empty($row['card_status']) && $row['card_status'] !== 'active') {
+        $status = 'inactive';
+    }
+
+    return [
+        'id' => (string)$row['user_id'],
+        'matric' => $row['matric_no'],
+        'name' => $row['full_name'],
+        'role' => $row['role'],
+        'rfid' => $row['rfid_uid'] ?? '',
+        'status' => $status,
+        'email' => $row['email'],
+        'phone' => $row['phone'] ?? '',
+        'dept' => $row['department'] ?? '',
+        'profileImage' => $row['profile_image'] ?? '',
+        'cardStatus' => $row['card_status'] ?? '',
+        'studentStats' => $studentStats[$userId] ?? [
+            'courseCount' => 0,
+            'attendanceRate' => 0,
+            'attendanceRecords' => 0,
+            'warningCount' => 0,
+            'excuseCount' => 0
+        ],
+        'lecturerStats' => $lecturerStats[$userId] ?? [
+            'courseCount' => 0,
+            'scheduleCount' => 0,
+            'sessionCount' => 0,
+            'studentCount' => 0
+        ]
+    ];
+}, $usersRows);
+?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -115,6 +525,8 @@
             transition: var(--transition);
             text-decoration: none;
             color: inherit;
+            border: 0;
+            font: inherit;
         }
 
         .admin-profile:hover {
@@ -129,6 +541,56 @@
             border-radius: 50%;
             object-fit: cover;
             border: 2px solid var(--primary);
+        }
+
+        .admin-menu {
+            position: relative;
+        }
+
+        .profile-caret {
+            color: var(--gray);
+            font-size: 0.8rem;
+        }
+
+        .admin-dropdown {
+            position: absolute;
+            right: 0;
+            top: calc(100% + 10px);
+            min-width: 180px;
+            padding: 8px;
+            border-radius: 14px;
+            background: white;
+            box-shadow: 0 18px 40px rgba(15, 23, 42, 0.16);
+            border: 1px solid rgba(67, 97, 238, 0.12);
+            opacity: 0;
+            visibility: hidden;
+            transform: translateY(-6px);
+            transition: var(--transition);
+            z-index: 20;
+        }
+
+        .admin-menu:hover .admin-dropdown,
+        .admin-menu:focus-within .admin-dropdown {
+            opacity: 1;
+            visibility: visible;
+            transform: translateY(0);
+        }
+
+        .admin-dropdown a {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 11px 12px;
+            border-radius: 10px;
+            color: var(--dark);
+            text-decoration: none;
+            font-weight: 600;
+            transition: var(--transition);
+        }
+
+        .admin-dropdown a:hover {
+            background: linear-gradient(135deg, rgba(6, 120, 88, 0.08), rgba(67, 97, 238, 0.08));
+            color: var(--primary);
         }
 
         /* SIDEBAR */
@@ -498,9 +960,10 @@
 
         /* ACTION BUTTONS */
         .action-buttons-cell {
-            display: flex;
-            gap: 8px;
-            flex-wrap: wrap;
+            display: grid;
+            grid-template-columns: repeat(2, max-content);
+            gap: 6px;
+            align-items: center;
         }
 
         .btn-action {
@@ -518,8 +981,10 @@
         }
 
         .btn-action-sm {
-            padding: 6px 12px;
-            font-size: 0.8rem;
+            min-width: 92px;
+            justify-content: center;
+            padding: 7px 10px;
+            font-size: 0.78rem;
         }
 
         .btn-assign { background: var(--primary); color: white; }
@@ -533,6 +998,87 @@
             transform: translateY(-2px);
             text-decoration: none;
             color: inherit;
+        }
+
+        .view-profile {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: 1rem;
+            background: linear-gradient(135deg, #f8fbff, #eef7f1);
+            border: 1px solid #e2e8f0;
+            border-radius: var(--border-radius);
+            margin-bottom: 1.2rem;
+        }
+
+        .view-profile img {
+            width: 86px;
+            height: 86px;
+            border-radius: 20px;
+            object-fit: cover;
+            border: 3px solid white;
+            box-shadow: var(--shadow);
+            background: white;
+        }
+
+        .view-profile h4 {
+            font-size: 1.35rem;
+            margin-bottom: 0.25rem;
+            color: var(--dark);
+        }
+
+        .view-detail-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 0.9rem;
+        }
+
+        .view-detail {
+            padding: 0.9rem;
+            border: 1px solid #edf1f5;
+            border-radius: 10px;
+            background: #fff;
+        }
+
+        .view-detail span {
+            display: block;
+            color: var(--gray);
+            font-size: 0.82rem;
+            font-weight: 800;
+            text-transform: uppercase;
+            margin-bottom: 0.3rem;
+        }
+
+        .view-detail strong {
+            color: var(--dark);
+            word-break: break-word;
+        }
+
+        .view-summary {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 0.8rem;
+            margin-top: 1rem;
+        }
+
+        .view-summary-card {
+            padding: 0.95rem;
+            border-radius: 12px;
+            background: #f8fafc;
+            border: 1px solid #edf1f5;
+            text-align: center;
+        }
+
+        .view-summary-card strong {
+            display: block;
+            font-size: 1.5rem;
+            color: var(--primary);
+        }
+
+        .view-summary-card span {
+            color: var(--gray);
+            font-size: 0.82rem;
+            font-weight: 700;
         }
 
         /* MODAL STYLES */
@@ -758,7 +1304,7 @@
             }
             
             .action-buttons-cell {
-                flex-direction: column;
+                grid-template-columns: 1fr;
             }
         }
 
@@ -809,6 +1355,7 @@
             }
         }
     </style>
+    <link rel="stylesheet" href="../assets/css/app-polish.css">
 </head>
 <body>
     <!-- MODALS -->
@@ -828,9 +1375,6 @@
                             </label>
                             <label style="display: flex; align-items: center; gap: 0.5rem;">
                                 <input type="radio" name="userType" value="lecturer"> Lecturer
-                            </label>
-                            <label style="display: flex; align-items: center; gap: 0.5rem;">
-                                <input type="radio" name="userType" value="staff"> Staff
                             </label>
                         </div>
                     </div>
@@ -858,8 +1402,15 @@
                     </div>
                     
                     <div class="form-group">
-                        <label class="form-label">Course/Department</label>
-                        <input type="text" class="form-control" id="userDepartment" placeholder="e.g., Computer Science">
+                        <label class="form-label">Course</label>
+                        <select class="form-control" id="courseCode" required>
+                            <option value="" selected disabled>Select Course</option>
+                            <option value="BIW">BIW</option>
+                            <option value="BIM">BIM</option>
+                            <option value="BIP">BIP</option>
+                            <option value="BIT">BIT</option>
+                            <option value="BIS">BIS</option>
+                        </select>
                     </div>
                     
                     <div class="form-group">
@@ -890,9 +1441,11 @@
                     <label class="form-label">User</label>
                     <select class="form-control" id="assignUserSelect">
                         <option value="">Select a user...</option>
-                        <option value="DI230076">DI230076 - Nur Alya Nadhirah</option>
-                        <option value="DI230081">DI230081 - Adam</option>
-                        <option value="STF004">STF004 - Dr. Nurul Aswa</option>
+                        <?php foreach ($usersRows as $userOption): ?>
+                            <option value="<?= htmlspecialchars($userOption['user_id']) ?>">
+                                <?= htmlspecialchars($userOption['matric_no'] . ' - ' . $userOption['full_name']) ?>
+                            </option>
+                        <?php endforeach; ?>
                     </select>
                 </div>
                 
@@ -900,16 +1453,16 @@
                     <label class="form-label">Scan RFID Card</label>
                     <div style="text-align: center; padding: 2rem; border: 2px dashed #ddd; border-radius: 10px; margin-bottom: 1rem;">
                         <i class="fas fa-id-card" style="font-size: 3rem; color: var(--primary); margin-bottom: 1rem;"></i>
-                        <p>Place RFID card near the reader</p>
+                        <p>Enter the UID shown in Arduino Serial Monitor</p>
                         <div id="rfidScanStatus" style="color: var(--gray); font-size: 0.9rem; margin-top: 0.5rem;">
-                            Waiting for RFID scan...
+                            Ready for RFID UID input
                         </div>
                     </div>
                 </div>
                 
                 <div class="form-group">
                     <label class="form-label">RFID UID</label>
-                    <input type="text" class="form-control" id="assignRFIDUid" placeholder="e.g., A3F9X2" readonly>
+                    <input type="text" class="form-control" id="assignRFIDUid" placeholder="e.g., 60CCFC61">
                 </div>
                 
                 <div class="form-group">
@@ -939,10 +1492,7 @@
             </div>
             <div class="modal-body">
                 <form id="editUserForm">
-                    <div class="form-group">
-                        <label class="form-label">User ID</label>
-                        <input type="text" class="form-control" id="editUserId" readonly>
-                    </div>
+                    <input type="hidden" id="editUserId">
                     
                     <div class="form-row">
                         <div class="form-group">
@@ -965,15 +1515,28 @@
                             <select class="form-control" id="editUserRole">
                                 <option value="student">Student</option>
                                 <option value="lecturer">Lecturer</option>
-                                <option value="staff">Staff</option>
                                 <option value="admin">Admin</option>
                             </select>
                         </div>
                     </div>
-                    
+
                     <div class="form-group">
-                        <label class="form-label">Department/Course</label>
-                        <input type="text" class="form-control" id="editUserDepartment">
+                        <label class="form-label">Course</label>
+                        <select class="form-control" id="editUserDepartment" required>
+                            <option value="BIW">BIW</option>
+                            <option value="BIM">BIM</option>
+                            <option value="BIP">BIP</option>
+                            <option value="BIT">BIT</option>
+                            <option value="BIS">BIS</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Student Profile Image</label>
+                        <input type="file" class="form-control" id="editUserProfileImage" accept="image/jpeg,image/png,image/webp">
+                        <div style="color: var(--gray); font-size: 0.9rem; margin-top: 0.5rem;">
+                            Upload JPG, PNG, or WEBP. This photo appears in lecturer live attendance when RFID/QR attendance is recorded.
+                        </div>
                     </div>
                     
                     <div class="form-group">
@@ -995,6 +1558,115 @@
         </div>
     </div>
 
+    <div id="viewUserModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title">User Details</h3>
+                <button class="modal-close" onclick="closeModal('viewUserModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="view-profile">
+                    <img id="viewUserImage" src="" alt="User profile">
+                    <div>
+                        <h4 id="viewUserName">User Name</h4>
+                        <div id="viewUserIdText" style="color: var(--gray); font-weight: 700;">-</div>
+                        <div style="margin-top: 0.5rem;">
+                            <span id="viewUserRoleBadge" class="role-badge role-student">Student</span>
+                            <span id="viewUserStatusBadge" class="status-badge-table status-active">Active</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="view-detail-grid">
+                    <div class="view-detail">
+                        <span>Email</span>
+                        <strong id="viewUserEmail">-</strong>
+                    </div>
+                    <div class="view-detail">
+                        <span>Phone</span>
+                        <strong id="viewUserPhone">-</strong>
+                    </div>
+                    <div class="view-detail">
+                        <span>Course / Department</span>
+                        <strong id="viewUserDepartment">-</strong>
+                    </div>
+                    <div class="view-detail">
+                        <span>RFID UID</span>
+                        <strong id="viewUserRfid">-</strong>
+                    </div>
+                    <div class="view-detail">
+                        <span>RFID Card Status</span>
+                        <strong id="viewUserCardStatus">-</strong>
+                    </div>
+                    <div class="view-detail">
+                        <span>Account ID</span>
+                        <strong id="viewUserAccountId">-</strong>
+                    </div>
+                </div>
+
+                <div class="view-summary" id="viewUserSummary"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal('viewUserModal')">Close</button>
+                <button class="btn btn-primary" onclick="editViewedUser()">
+                    <i class="fas fa-edit"></i> Edit User
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div id="exportUsersModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title">Export User List</h3>
+                <button class="modal-close" onclick="closeModal('exportUsersModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">User List</label>
+                    <select class="form-control" id="exportUserRole">
+                        <option value="all">All Users</option>
+                        <option value="student">Student List</option>
+                        <option value="lecturer">Lecturer List</option>
+                        <option value="admin">Admin List</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Course</label>
+                    <select class="form-control" id="exportUserCourse">
+                        <option value="all">All Courses</option>
+                        <option value="BIW">BIW</option>
+                        <option value="BIM">BIM</option>
+                        <option value="BIP">BIP</option>
+                        <option value="BIT">BIT</option>
+                        <option value="BIS">BIS</option>
+                    </select>
+                    <div style="color: var(--gray); font-size: 0.9rem; margin-top: 0.5rem;">
+                        Use this to export student or lecturer lists by course group.
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Format</label>
+                    <select class="form-control" id="exportUserFormat">
+                        <option value="csv">CSV / Excel</option>
+                        <option value="pdf">PDF Print View</option>
+                    </select>
+                    <div style="color: var(--gray); font-size: 0.9rem; margin-top: 0.5rem;">
+                        PDF Print View opens a neat report page. Use Print then Save as PDF.
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal('exportUsersModal')">Cancel</button>
+                <button class="btn btn-primary" onclick="exportData()">
+                    <i class="fas fa-file-export"></i> Export
+                </button>
+            </div>
+        </div>
+    </div>
+
     <!-- TOAST NOTIFICATION -->
     <div id="toast" class="toast" style="display: none;">
         <i id="toastIcon" class="fas fa-check-circle"></i>
@@ -1006,7 +1678,7 @@
     <div class="dashboard-container">
         <!-- HEADER -->
         <header class="header">
-            <a href="admin-dashboard.html" class="logo">
+            <a href="dashboard.php" class="logo">
                 <i class="fas fa-id-card"></i>
                 <div>
                     <h1>RFID IoT Attendance</h1>
@@ -1015,26 +1687,17 @@
             </a>
             
             <div class="header-right">
-                <div class="status-badge">
-                    <i class="fas fa-circle fa-xs"></i>
-                    <span>Online</span>
-                </div>
-                <div class="status-badge offline">
-                    <i class="fas fa-sync-alt"></i>
-                    <span id="syncQueue">Sync Queue: 2</span>
-                </div>
-                <div class="status-badge">
-                    <i class="fas fa-rss"></i>
-                    <span id="rfidReaders">RFID Readers: 8 Active</span>
-                </div>
-                
-                <a href="#" class="admin-profile">
-                    <img src="https://ui-avatars.com/api/?name=Admin+User&background=4361ee&color=fff&size=128" alt="Admin">
-                    <div>
+                <div class="admin-menu">
+                    <button type="button" class="admin-profile">
+                        <img src="https://ui-avatars.com/api/?name=Admin+User&background=4361ee&color=fff&size=128" alt="Admin">
                         <div style="font-weight: 600;">Admin</div>
-                        <div style="font-size: 0.85rem; color: var(--gray);">Super Admin</div>
+                        <i class="fas fa-chevron-down profile-caret"></i>
+                    </button>
+                    <div class="admin-dropdown">
+                        <a href="../admin/settings.php"><i class="fas fa-cog"></i> Settings</a>
+                        <a href="../logout.php"><i class="fas fa-sign-out-alt"></i> Logout</a>
                     </div>
-                </a>
+                </div>
             </div>
         </header>
 
@@ -1070,29 +1733,6 @@
 </li>
                 </ul>
             </div>
-            
-            <div class="sidebar-section">
-                <h3>System</h3>
-                <ul class="nav-menu">
-                    <li class="nav-item">
-                        <i class="fas fa-cog"></i>
-                        <span>Settings</span>
-                    </li>
-                    <li class="nav-item">
-                        <i class="fas fa-bell"></i>
-                        <span>Notifications</span>
-                    </li>
-                    <li class="nav-item">
-                        <i class="fas fa-shield-alt"></i>
-                        <span>Security</span>
-                    </li>
-                </ul>
-            </div>
-            
-            <button class="logout-btn" onclick="window.location.href='../logout.php'">
-                <i class="fas fa-sign-out-alt"></i>
-                <span>Logout</span>
-            </button>
         </nav>
 
         <!-- MAIN CONTENT -->
@@ -1111,7 +1751,7 @@
                     <button class="btn btn-success" onclick="openModal('assignRFIDModal')">
                         <i class="fas fa-id-card"></i> Assign RFID
                     </button>
-                    <button class="btn btn-outline">
+                    <button class="btn btn-outline" onclick="openModal('exportUsersModal')">
                         <i class="fas fa-file-export"></i> Export
                     </button>
                 </div>
@@ -1126,7 +1766,6 @@
                             <option value="all">All Roles</option>
                             <option value="student">Student</option>
                             <option value="lecturer">Lecturer</option>
-                            <option value="staff">Staff</option>
                             <option value="admin">Admin</option>
                         </select>
                     </div>
@@ -1137,7 +1776,6 @@
                             <option value="all">All Status</option>
                             <option value="active">Active</option>
                             <option value="inactive">Inactive</option>
-                            <option value="pending">Pending</option>
                         </select>
                     </div>
                     
@@ -1149,11 +1787,23 @@
                             <option value="unassigned">No RFID</option>
                         </select>
                     </div>
+
+                    <div class="filter-group">
+                        <label class="filter-label">Course</label>
+                        <select class="filter-select" id="courseFilter" onchange="filterUsers()">
+                            <option value="all">All Courses</option>
+                            <option value="BIW">BIW</option>
+                            <option value="BIM">BIM</option>
+                            <option value="BIP">BIP</option>
+                            <option value="BIT">BIT</option>
+                            <option value="BIS">BIS</option>
+                        </select>
+                    </div>
                     
                     <div class="search-box">
                         <label class="filter-label">Search</label>
-                        <input type="text" class="filter-input search-input" id="searchInput" 
-                               placeholder="Search name / matric / RFID UID" onkeyup="searchUsers()">
+                        <input type="text" class="filter-input search-input" id="searchInput"
+                               placeholder="Search name / matric / RFID UID / course" onkeyup="filterUsers()">
                     </div>
                 </div>
             </div>
@@ -1229,6 +1879,7 @@
                                 <th>Matric / Staff ID</th>
                                 <th>Name</th>
                                 <th>Role</th>
+                                <th>Course</th>
                                 <th>RFID UID</th>
                                 <th>Status</th>
                                 <th>Actions</th>
@@ -1260,23 +1911,33 @@
     </div>
 
     <script>
-        // Sample Data
-        const usersData = [
-            { id: "DI230076", name: "Nur Alya Nadhirah", role: "student", rfid: "A3F9X2", status: "active", email: "nuralya@university.edu", phone: "+60 12-345 6789", dept: "Computer Science" },
-            { id: "DI230081", name: "Adam", role: "student", rfid: "", status: "inactive", email: "adam@university.edu", phone: "+60 13-456 7890", dept: "Software Engineering" },
-            { id: "STF004", name: "Dr. Nurul Aswa", role: "lecturer", rfid: "L9C31A", status: "active", email: "nurulaswa@university.edu", phone: "+60 14-567 8901", dept: "Faculty of Computing" },
-            { id: "DI230110", name: "Siti", role: "student", rfid: "882201", status: "active", email: "siti@university.edu", phone: "+60 15-678 9012", dept: "Data Science" },
-            { id: "STF012", name: "Prof. Ahmad", role: "lecturer", rfid: "B5D42C", status: "active", email: "ahmad@university.edu", phone: "+60 16-789 0123", dept: "Faculty of Engineering" },
-            { id: "ADM001", name: "Admin User", role: "admin", rfid: "AD1234", status: "active", email: "admin@university.edu", phone: "+60 17-890 1234", dept: "Administration" },
-            { id: "DI230115", name: "Ahmad", role: "student", rfid: "A1B2C3", status: "active", email: "ahmad.s@university.edu", phone: "+60 18-901 2345", dept: "Cyber Security" },
-            { id: "DI230120", name: "Sarah", role: "student", rfid: "D4E5F6", status: "pending", email: "sarah@university.edu", phone: "+60 19-012 3456", dept: "AI & Machine Learning" },
-            { id: "STF008", name: "Dr. Lee", role: "lecturer", rfid: "", status: "inactive", email: "lee@university.edu", phone: "+60 10-123 4567", dept: "Faculty of Business" },
-            { id: "DI230125", name: "Raju", role: "student", rfid: "X7Y8Z9", status: "active", email: "raju@university.edu", phone: "+60 11-234 5678", dept: "Network Technology" }
-        ];
+        const usersData = <?= json_encode($usersData, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
 
         let currentPage = 1;
         const itemsPerPage = 8;
         let filteredData = [...usersData];
+        let currentViewedUserId = null;
+
+        function escapeHtml(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+
+        function profileImageUrl(user) {
+            if (user.profileImage) {
+                if (/^https?:\/\//i.test(user.profileImage)) {
+                    return user.profileImage;
+                }
+
+                return '../' + String(user.profileImage).replace(/^\/+/, '');
+            }
+
+            return `https://ui-avatars.com/api/?name=${encodeURIComponent(user.name || 'User')}&background=006837&color=fff&size=128`;
+        }
 
         // Initialize page
         document.addEventListener('DOMContentLoaded', function() {
@@ -1305,10 +1966,6 @@
         // Modal Functions
         function openModal(modalId) {
             document.getElementById(modalId).style.display = 'flex';
-            
-            if (modalId === 'assignRFIDModal') {
-                simulateRFIDScan();
-            }
         }
 
         function closeModal(modalId) {
@@ -1418,11 +2075,20 @@
                         </button>
                     `;
                 }
+
+                if (['student', 'lecturer'].includes(user.role)) {
+                    actionButtons += `
+                        <button class="btn-action btn-delete btn-action-sm" onclick="deleteUser('${user.id}')">
+                            <i class="fas fa-trash"></i> Delete
+                        </button>
+                    `;
+                }
                 
                 row.innerHTML = `
-                    <td><strong>${user.id}</strong></td>
+                    <td><strong>${user.matric || user.id}</strong></td>
                     <td>${user.name}</td>
                     <td><span class="role-badge ${roleClass}">${roleText}</span></td>
+                    <td><strong>${escapeHtml(user.dept || '-')}</strong></td>
                     <td>${rfidDisplay}</td>
                     <td><span class="status-badge-table ${statusClass}">${statusText}</span></td>
                     <td>
@@ -1448,6 +2114,8 @@
             const roleFilter = document.getElementById('roleFilter').value;
             const statusFilter = document.getElementById('statusFilter').value;
             const rfidFilter = document.getElementById('rfidFilter').value;
+            const courseFilter = document.getElementById('courseFilter').value;
+            const searchTerm = document.getElementById('searchInput').value.toLowerCase();
             
             filteredData = usersData.filter(user => {
                 // Role filter
@@ -1459,6 +2127,20 @@
                 // RFID filter
                 if (rfidFilter === 'assigned' && !user.rfid) return false;
                 if (rfidFilter === 'unassigned' && user.rfid) return false;
+
+                // Course filter
+                if (courseFilter !== 'all' && user.dept !== courseFilter) return false;
+
+                if (searchTerm !== '') {
+                    const matchesSearch =
+                        user.id.toLowerCase().includes(searchTerm) ||
+                        (user.matric && user.matric.toLowerCase().includes(searchTerm)) ||
+                        user.name.toLowerCase().includes(searchTerm) ||
+                        (user.rfid && user.rfid.toLowerCase().includes(searchTerm)) ||
+                        (user.dept && user.dept.toLowerCase().includes(searchTerm));
+
+                    if (!matchesSearch) return false;
+                }
                 
                 return true;
             });
@@ -1469,21 +2151,7 @@
         }
 
         function searchUsers() {
-            const searchTerm = document.getElementById('searchInput').value.toLowerCase();
-            
-            if (searchTerm === '') {
-                filteredData = [...usersData];
-            } else {
-                filteredData = usersData.filter(user => 
-                    user.id.toLowerCase().includes(searchTerm) ||
-                    user.name.toLowerCase().includes(searchTerm) ||
-                    (user.rfid && user.rfid.toLowerCase().includes(searchTerm))
-                );
-            }
-            
-            currentPage = 1;
-            populateUsersTable();
-            updatePagination();
+            filterUsers();
         }
 
         function changePage(page) {
@@ -1516,37 +2184,56 @@
             const userId = document.getElementById('userId').value;
             const userName = document.getElementById('userName').value;
             const userType = document.querySelector('input[name="userType"]:checked').value;
+            const userEmail = document.getElementById('userEmail').value;
+            const assignNow = document.getElementById('assignRFIDNow').checked;
             
-            if (!userId || !userName) {
+            if (!userId || !userName || !userEmail) {
                 showToast('Please fill in all required fields', 'error');
                 return;
             }
-            
-            // Add new user to data
-            const newUser = {
-                id: userId,
-                name: userName,
-                role: userType,
-                rfid: document.getElementById('assignRFIDNow').checked ? 'NEWRFID' : '',
-                status: 'active',
-                email: document.getElementById('userEmail').value,
-                phone: document.getElementById('userPhone').value,
-                dept: document.getElementById('userDepartment').value
-            };
-            
-            usersData.unshift(newUser);
-            filteredData.unshift(newUser);
-            
-            // Update stats
-            updateStats();
-            updateUserCounts();
-            
-            // Reset form and close modal
-            document.getElementById('addUserForm').reset();
-            closeModal('addUserModal');
-            populateUsersTable();
-            
-            showToast(`User ${userName} added successfully!`, 'success');
+
+            const formData = new URLSearchParams();
+            formData.append('action', 'add_user');
+            formData.append('matric_no', userId);
+            formData.append('full_name', userName);
+            formData.append('email', userEmail);
+            formData.append('phone', document.getElementById('userPhone').value);
+            formData.append('department', document.getElementById('courseCode').value);
+            formData.append('role', userType);
+
+            fetch('users.php', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: formData.toString()
+            })
+                .then(response => response.json())
+                .then(data => {
+                    if (!data.ok) {
+                        showToast(data.message, 'error');
+                        return;
+                    }
+
+                    usersData.unshift(data.user);
+                    filteredData = [...usersData];
+                    updateStats();
+                    updateUserCounts();
+                    populateUsersTable();
+
+                    const option = document.createElement('option');
+                    option.value = data.user.id;
+                    option.textContent = `${data.user.matric} - ${data.user.name}`;
+                    document.getElementById('assignUserSelect').prepend(option);
+
+                    document.getElementById('addUserForm').reset();
+                    closeModal('addUserModal');
+                    showToast(data.message, 'success');
+
+                    if (assignNow) {
+                        document.getElementById('assignUserSelect').value = data.user.id;
+                        setTimeout(() => openModal('assignRFIDModal'), 500);
+                    }
+                })
+                .catch(() => showToast('Unable to add user. Please try again.', 'error'));
         }
 
         function editUser(userId) {
@@ -1561,6 +2248,7 @@
             document.getElementById('editUserRole').value = user.role;
             document.getElementById('editUserDepartment').value = user.dept;
             document.getElementById('editUserStatus').value = user.status;
+            document.getElementById('editUserProfileImage').value = '';
             
             openModal('editUserModal');
         }
@@ -1570,26 +2258,61 @@
             const userIndex = usersData.findIndex(u => u.id === userId);
             
             if (userIndex === -1) return;
-            
-            // Update user data
-            usersData[userIndex].name = document.getElementById('editUserName').value;
-            usersData[userIndex].email = document.getElementById('editUserEmail').value;
-            usersData[userIndex].phone = document.getElementById('editUserPhone').value;
-            usersData[userIndex].role = document.getElementById('editUserRole').value;
-            usersData[userIndex].dept = document.getElementById('editUserDepartment').value;
-            usersData[userIndex].status = document.getElementById('editUserStatus').value;
-            
-            // Update filtered data
-            const filteredIndex = filteredData.findIndex(u => u.id === userId);
-            if (filteredIndex !== -1) {
-                filteredData[filteredIndex] = { ...usersData[userIndex] };
+
+            const formData = new FormData();
+            formData.append('action', 'update_user');
+            formData.append('user_id', userId);
+            formData.append('full_name', document.getElementById('editUserName').value);
+            formData.append('email', document.getElementById('editUserEmail').value);
+            formData.append('phone', document.getElementById('editUserPhone').value);
+            formData.append('role', document.getElementById('editUserRole').value);
+            formData.append('department', document.getElementById('editUserDepartment').value);
+            const selectedStatus = document.getElementById('editUserStatus').value;
+            if (selectedStatus !== 'active') {
+                const confirmed = confirm('This will deactivate the account and the user will not be able to login. Continue?');
+                if (!confirmed) {
+                    return;
+                }
             }
-            
-            closeModal('editUserModal');
-            populateUsersTable();
-            updateStats();
-            
-            showToast(`User ${usersData[userIndex].name} updated successfully!`, 'success');
+            formData.append('status', selectedStatus);
+
+            const imageInput = document.getElementById('editUserProfileImage');
+            if (imageInput.files.length > 0) {
+                formData.append('profile_image', imageInput.files[0]);
+            }
+
+            fetch('users.php', {
+                method: 'POST',
+                body: formData
+            })
+                .then(response => response.json())
+                .then(data => {
+                    if (!data.ok) {
+                        showToast(data.message, 'error');
+                        return;
+                    }
+
+                    usersData[userIndex].name = document.getElementById('editUserName').value;
+                    usersData[userIndex].email = document.getElementById('editUserEmail').value;
+                    usersData[userIndex].phone = document.getElementById('editUserPhone').value;
+                    usersData[userIndex].role = document.getElementById('editUserRole').value;
+                    usersData[userIndex].dept = document.getElementById('editUserDepartment').value;
+                    usersData[userIndex].status = selectedStatus;
+                    if (data.profile_image) {
+                        usersData[userIndex].profileImage = data.profile_image;
+                    }
+
+                    const filteredIndex = filteredData.findIndex(u => u.id === userId);
+                    if (filteredIndex !== -1) {
+                        filteredData[filteredIndex] = { ...usersData[userIndex] };
+                    }
+
+                    closeModal('editUserModal');
+                    populateUsersTable();
+                    updateStats();
+                    showToast(data.message, 'success');
+                })
+                .catch(() => showToast('Unable to update user. Please try again.', 'error'));
         }
 
         function assignRFIDToUser(userId) {
@@ -1604,7 +2327,6 @@
             const modal = document.getElementById('assignRFIDModal');
             modal.addEventListener('click', function(e) {
                 if (e.target.closest('.modal-content')) return;
-                simulateRFIDScan();
             });
         }
 
@@ -1632,35 +2354,36 @@
 
         function assignRFID() {
             const userId = document.getElementById('assignUserSelect').value;
-            const rfidUid = document.getElementById('assignRFIDUid').value;
+            const rfidUid = document.getElementById('assignRFIDUid').value.trim().toUpperCase();
             const cardStatus = document.getElementById('cardStatus').value;
             
             if (!userId || !rfidUid) {
-                showToast('Please select a user and scan a card', 'error');
+                showToast('Please select a user and enter RFID UID', 'error');
                 return;
             }
-            
-            const userIndex = usersData.findIndex(u => u.id === userId);
-            if (userIndex === -1) return;
-            
-            // Assign RFID
-            usersData[userIndex].rfid = rfidUid;
-            usersData[userIndex].status = cardStatus === 'active' ? 'active' : 'inactive';
-            
-            // Update filtered data
-            const filteredIndex = filteredData.findIndex(u => u.id === userId);
-            if (filteredIndex !== -1) {
-                filteredData[filteredIndex] = { ...usersData[userIndex] };
-            }
-            
-            // Update stats
-            updateStats();
-            updateUserCounts();
-            
-            closeModal('assignRFIDModal');
-            populateUsersTable();
-            
-            showToast(`RFID card ${rfidUid} assigned to user ${usersData[userIndex].name}`, 'success');
+
+            const formData = new URLSearchParams();
+            formData.append('action', 'assign_rfid');
+            formData.append('user_id', userId);
+            formData.append('uid', rfidUid);
+            formData.append('status', cardStatus);
+
+            fetch('users.php', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: formData.toString()
+            })
+                .then(response => response.json())
+                .then(data => {
+                    if (!data.ok) {
+                        showToast(data.message, 'error');
+                        return;
+                    }
+
+                    showToast(data.message, 'success');
+                    setTimeout(() => window.location.reload(), 700);
+                })
+                .catch(() => showToast('Unable to assign RFID. Please try again.', 'error'));
         }
 
         function replaceRFID(userId) {
@@ -1675,10 +2398,116 @@
 
         function viewUser(userId) {
             const user = usersData.find(u => u.id === userId);
-            if (user) {
-                showToast(`Viewing details for ${user.name}`, 'info');
-                // In a real app, you would navigate to user detail page
+            if (!user) return;
+
+            currentViewedUserId = userId;
+
+            const roleText = user.role.charAt(0).toUpperCase() + user.role.slice(1);
+            const statusText = user.status.charAt(0).toUpperCase() + user.status.slice(1);
+            const roleClass = user.role === 'lecturer' ? 'role-lecturer' : (user.role === 'admin' ? 'role-admin' : 'role-student');
+            const statusClass = user.status === 'active' ? 'status-active' : (user.status === 'pending' ? 'status-pending' : 'status-inactive');
+
+            document.getElementById('viewUserImage').src = profileImageUrl(user);
+            document.getElementById('viewUserName').textContent = user.name || '-';
+            document.getElementById('viewUserIdText').textContent = user.matric || user.id || '-';
+            document.getElementById('viewUserEmail').textContent = user.email || '-';
+            document.getElementById('viewUserPhone').textContent = user.phone || '-';
+            document.getElementById('viewUserDepartment').textContent = user.dept || '-';
+            document.getElementById('viewUserRfid').textContent = user.rfid || 'Not assigned';
+            document.getElementById('viewUserCardStatus').textContent = user.cardStatus ? user.cardStatus.toUpperCase() : (user.rfid ? user.status.toUpperCase() : 'Not assigned');
+            document.getElementById('viewUserAccountId').textContent = user.id || '-';
+
+            const roleBadge = document.getElementById('viewUserRoleBadge');
+            roleBadge.className = `role-badge ${roleClass}`;
+            roleBadge.textContent = roleText;
+
+            const statusBadge = document.getElementById('viewUserStatusBadge');
+            statusBadge.className = `status-badge-table ${statusClass}`;
+            statusBadge.textContent = statusText;
+
+            const summary = document.getElementById('viewUserSummary');
+            if (user.role === 'student') {
+                const stats = user.studentStats || {};
+                summary.innerHTML = `
+                    <div class="view-summary-card"><strong>${escapeHtml(stats.courseCount ?? 0)}</strong><span>Enrolled Courses</span></div>
+                    <div class="view-summary-card"><strong>${escapeHtml(stats.attendanceRate ?? 0)}%</strong><span>Attendance Rate</span></div>
+                    <div class="view-summary-card"><strong>${escapeHtml(stats.warningCount ?? 0)}</strong><span>Warning Letters</span></div>
+                    <div class="view-summary-card"><strong>${escapeHtml(stats.excuseCount ?? 0)}</strong><span>Excuse / MC Files</span></div>
+                `;
+            } else if (user.role === 'lecturer') {
+                const stats = user.lecturerStats || {};
+                summary.innerHTML = `
+                    <div class="view-summary-card"><strong>${escapeHtml(stats.courseCount ?? 0)}</strong><span>Assigned Courses</span></div>
+                    <div class="view-summary-card"><strong>${escapeHtml(stats.scheduleCount ?? 0)}</strong><span>Schedules</span></div>
+                    <div class="view-summary-card"><strong>${escapeHtml(stats.sessionCount ?? 0)}</strong><span>Sessions</span></div>
+                    <div class="view-summary-card"><strong>${escapeHtml(stats.studentCount ?? 0)}</strong><span>Students</span></div>
+                `;
+            } else {
+                summary.innerHTML = `
+                    <div class="view-summary-card"><strong>${escapeHtml(user.role)}</strong><span>System Role</span></div>
+                    <div class="view-summary-card"><strong>${escapeHtml(user.status)}</strong><span>Account Status</span></div>
+                    <div class="view-summary-card"><strong>${user.rfid ? 'Yes' : 'No'}</strong><span>RFID Assigned</span></div>
+                    <div class="view-summary-card"><strong>${escapeHtml(user.dept || '-')}</strong><span>Course</span></div>
+                `;
             }
+
+            openModal('viewUserModal');
+        }
+
+        function editViewedUser() {
+            if (!currentViewedUserId) return;
+            closeModal('viewUserModal');
+            editUser(currentViewedUserId);
+        }
+
+        function deleteUser(userId) {
+            const user = usersData.find(u => u.id === userId);
+            if (!user) return;
+
+            if (!['student', 'lecturer'].includes(user.role)) {
+                showToast('Only student and lecturer accounts can be deleted here.', 'error');
+                return;
+            }
+
+            const confirmed = confirm(
+                `Delete ${user.name}?\n\nThis will deactivate the account and RFID card, but existing attendance records will be kept for reports.`
+            );
+
+            if (!confirmed) return;
+
+            const formData = new URLSearchParams();
+            formData.append('action', 'delete_user');
+            formData.append('user_id', userId);
+
+            fetch('users.php', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: formData.toString()
+            })
+                .then(response => response.json())
+                .then(data => {
+                    if (!data.ok) {
+                        showToast(data.message, 'error');
+                        return;
+                    }
+
+                    const allIndex = usersData.findIndex(u => u.id === userId);
+                    if (allIndex !== -1) {
+                        usersData.splice(allIndex, 1);
+                    }
+
+                    filteredData = filteredData.filter(u => u.id !== userId);
+                    const totalPages = Math.max(1, Math.ceil(filteredData.length / itemsPerPage));
+                    if (currentPage > totalPages) {
+                        currentPage = totalPages;
+                    }
+
+                    populateUsersTable();
+                    updatePagination();
+                    updateStats();
+                    showToast(data.message, 'success');
+                })
+                .catch(() => showToast('Unable to delete user. Please try again.', 'error'));
         }
 
         // Stats Functions
@@ -1719,30 +2548,15 @@
 
         // Export function
         function exportData() {
-            showToast('Exporting user data...', 'info');
-            
-            setTimeout(() => {
-                showToast('Data exported successfully! Download will begin shortly.', 'success');
-                
-                // Simulate download
-                const csvContent = "data:text/csv;charset=utf-8," 
-                    + "ID,Name,Role,RFID UID,Status,Email,Phone,Department\n"
-                    + usersData.map(user => 
-                        `${user.id},${user.name},${user.role},${user.rfid || 'N/A'},${user.status},${user.email},${user.phone || 'N/A'},${user.dept || 'N/A'}`
-                    ).join("\n");
-                
-                const encodedUri = encodeURI(csvContent);
-                const link = document.createElement("a");
-                link.setAttribute("href", encodedUri);
-                link.setAttribute("download", `users_rfid_${new Date().toISOString().slice(0,10)}.csv`);
-                document.body.appendChild(link);
-                link.click();
-                document.body.removeChild(link);
-            }, 1000);
-        }
+            const role = document.getElementById('exportUserRole').value;
+            const format = document.getElementById('exportUserFormat').value;
+            const course = document.getElementById('exportUserCourse').value;
+            const url = `export_users.php?role=${encodeURIComponent(role)}&format=${encodeURIComponent(format)}&course=${encodeURIComponent(course)}`;
 
-        // Add event listener to export button
-        document.querySelector('.btn-outline').addEventListener('click', exportData);
+            closeModal('exportUsersModal');
+            window.location.href = url;
+            showToast(format === 'pdf' ? 'Opening PDF print view...' : 'Downloading CSV export...', 'success');
+        }
     </script>
 </body>
 </html>

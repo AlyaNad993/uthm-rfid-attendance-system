@@ -1,9 +1,13 @@
-<!-- test_connection.php -->
 <?php
 // Debug mode
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
 
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+
+echo "<!-- test_connection.php -->";
 echo "<h2>Database Connection Test</h2>";
 echo "<p>Testing connection to UTHM RFID database...</p>";
 
@@ -30,6 +34,7 @@ try {
         [
             PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::MYSQL_ATTR_USE_BUFFERED_QUERY => true,
         ]
     );
     
@@ -233,7 +238,6 @@ try {
     
     // Session test
     echo "<h3>8. Session Test:</h3>";
-    session_start();
     $_SESSION['test_time'] = date('Y-m-d H:i:s');
     
     if (isset($_SESSION['test_time'])) {
@@ -247,17 +251,23 @@ try {
     // Database permissions test
     echo "<h3>9. Database Permissions Test:</h3>";
     $permission_tests = [
-        "INSERT INTO users (matric_no, full_name, email, password_hash, role) VALUES ('TEST001', 'Test User', 'test@uthm.edu.my', 'test_hash', 'student')" => "INSERT permission",
-        "SELECT * FROM users LIMIT 1" => "SELECT permission",
-        "UPDATE users SET full_name = 'Test Updated' WHERE matric_no = 'TEST001'" => "UPDATE permission",
-        "DELETE FROM users WHERE matric_no = 'TEST001'" => "DELETE permission",
+        ["INSERT INTO users (matric_no, full_name, email, password_hash, role) VALUES ('TEST001', 'Test User', 'test@uthm.edu.my', 'test_hash', 'student')", "INSERT permission", false],
+        ["SELECT * FROM users LIMIT 1", "SELECT permission", true],
+        ["UPDATE users SET full_name = 'Test Updated' WHERE matric_no = 'TEST001'", "UPDATE permission", false],
+        ["DELETE FROM users WHERE matric_no = 'TEST001'", "DELETE permission", false],
     ];
     
     $test_pdo->beginTransaction(); // Start transaction to rollback
     
-    foreach ($permission_tests as $query => $permission) {
+    foreach ($permission_tests as [$query, $permission, $returnsRows]) {
         try {
-            $test_pdo->exec($query);
+            if ($returnsRows) {
+                $stmt = $test_pdo->query($query);
+                $stmt->fetchAll();
+                $stmt->closeCursor();
+            } else {
+                $test_pdo->exec($query);
+            }
             echo "<p style='color: green;'><strong>✓ $permission:</strong> OK</p>";
         } catch (Exception $e) {
             echo "<p style='color: orange;'><strong>⚠ $permission:</strong> Failed - " . $e->getMessage() . "</p>";

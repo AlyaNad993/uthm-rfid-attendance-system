@@ -1,0 +1,460 @@
+/* Lecturer-only visual refinement. Login page is not linked to this file. */
+:root {
+    --lr-ink: #172033;
+    --lr-muted: #65728a;
+    --lr-line: #dce6f2;
+    --lr-soft-line: rgba(220, 230, 242, 0.72);
+    --lr-surface: rgba(255, 255, 255, 0.92);
+    --lr-surface-strong: #ffffff;
+    --lr-green: #006837;
+    --lr-green-2: #0f7a4d;
+    --lr-blue: #4361ee;
+    --lr-blue-2: #315bdc;
+    --lr-teal: #0e8a83;
+    --lr-gold: #d98918;
+    --lr-red: #df3f3f;
+    --lr-radius: 16px;
+    --lr-radius-sm: 10px;
+    --lr-shadow: 0 20px 50px rgba(28, 52, 84, 0.14);
+    --lr-soft-shadow: 0 10px 28px rgba(28, 52, 84, 0.09);
+}
+
+body {
+    background:
+        radial-gradient(circle at 7% 8%, rgba(0, 104, 55, 0.16), transparent 30%),
+        radial-gradient(circle at 90% 12%, rgba(67, 97, 238, 0.14), transparent 28%),
+        linear-gradient(135deg, #f7fbff 0%, #edf8f3 100%) !important;
+    color: var(--lr-ink) !important;
+}
+
+.dashboard-container {
+    background: transparent !important;
+}
+
+.main-content,
+.page {
+    max-width: 1240px;
+    width: 100%;
+}
+
+.main-content {
+    padding: 28px !important;
+}
+
+.header,
+.topbar {
+    background:
+        linear-gradient(135deg, rgba(255, 255, 255, 0.96), rgba(248, 253, 251, 0.9)) !important;
+    border: 1px solid rgba(255, 255, 255, 0.78) !important;
+    box-shadow: var(--lr-shadow) !important;
+    backdrop-filter: blur(18px);
+}
+
+.header {
+    border-radius: 0 0 22px 22px !important;
+}
+
+.topbar {
+    border-radius: var(--lr-radius) !important;
+    margin-bottom: 22px !important;
+}
+
+.logo,
+.brand {
+    gap: 12px !important;
+}
+
+.logo i,
+.brand i {
+    color: var(--lr-green) !important;
+    background: linear-gradient(135deg, var(--lr-green), var(--lr-blue)) !important;
+    -webkit-background-clip: text !important;
+    -webkit-text-fill-color: transparent !important;
+}
+
+.logo h1,
+.brand h1,
+h1 {
+    color: var(--lr-ink) !important;
+    letter-spacing: 0 !important;
+}
+
+.logo h1,
+.brand h1 {
+    background: linear-gradient(135deg, var(--lr-green), var(--lr-blue)) !important;
+    -webkit-background-clip: text !important;
+    -webkit-text-fill-color: transparent !important;
+}
+
+h1::after {
+    width: 58px !important;
+    height: 3px !important;
+    margin-top: 9px !important;
+    background: linear-gradient(90deg, var(--lr-green), var(--lr-blue), var(--lr-teal)) !important;
+}
+
+.sidebar {
+    background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(248, 252, 250, 0.9)) !important;
+    border-right: 1px solid var(--lr-soft-line) !important;
+    box-shadow: 14px 0 34px rgba(28, 52, 84, 0.08) !important;
+}
+
+.sidebar-header,
+.profile-section,
+.user-profile {
+    border-color: var(--lr-soft-line) !important;
+}
+
+.nav-menu,
+.sidebar nav {
+    gap: 8px !important;
+}
+
+.nav-item,
+.nav-menu a,
+.sidebar a {
+    border-radius: var(--lr-radius-sm) !important;
+    color: #35435a !important;
+    font-weight: 700 !important;
+    transition: transform 0.18s ease, background 0.18s ease, color 0.18s ease, box-shadow 0.18s ease !important;
+}
+
+.nav-item i,
+.nav-menu a i,
+.sidebar a i {
+    color: var(--lr-green-2) !important;
+}
+
+.nav-item:hover,
+.nav-item.active,
+.nav-menu a:hover,
+.nav-menu a.active,
+.sidebar a:hover,
+.sidebar a.active {
+    background: linear-gradient(135deg, var(--lr-green), var(--lr-blue)) !important;
+    color: #fff !important;
+    box-shadow: 0 12px 24px rgba(0, 104, 55, 0.18) !important;
+    transform: translateX(4px) !important;
+}
+
+.nav-item:hover i,
+.nav-item.active i,
+.nav-menu a:hover i,
+.nav-menu a.active i,
+.sidebar a:hover i,
+.sidebar a.active i {
+    color: #fff !important;
+}
+
+.card,
+.panel,
+.stat,
+.stat-card,
+.notice,
+.session-list-card,
+.empty,
+.list,
+.filter,
+.section,
+.course-card,
+.class-card,
+.schedule-card,
+.settings-card,
+.notification,
+.table-container,
+.table-section,
+.modal-content {
+    background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(250, 253, 252, 0.94)) !important;
+    border: 1px solid rgba(220, 230, 242, 0.92) !important;
+    border-radius: var(--lr-radius) !important;
+    box-shadow: var(--lr-soft-shadow) !important;
+}
+
+.card:hover,
+.panel:hover,
+.stat:hover,
+.stat-card:hover,
+.action-card:hover,
+.session-row:hover,
+.session-link:hover,
+.schedule-row:hover,
+.notification:hover,
+.course-card:hover,
+.class-card:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--lr-shadow) !important;
+}
+
+.card-header,
+.panel-header,
+.section-header {
+    background:
+        linear-gradient(90deg, rgba(0, 104, 55, 0.08), rgba(67, 97, 238, 0.07), rgba(14, 138, 131, 0.06)) !important;
+    border-bottom: 1px solid var(--lr-soft-line) !important;
+    border-radius: var(--lr-radius) var(--lr-radius) 0 0 !important;
+}
+
+.welcome-banner {
+    background:
+        linear-gradient(135deg, rgba(0, 104, 55, 0.98), rgba(20, 119, 106, 0.95) 48%, rgba(67, 97, 238, 0.92)) !important;
+    border: 1px solid rgba(255, 255, 255, 0.26) !important;
+    border-radius: 18px !important;
+    box-shadow: 0 24px 58px rgba(0, 104, 55, 0.2) !important;
+}
+
+.welcome-banner::before {
+    background: rgba(255, 255, 255, 0.12) !important;
+}
+
+.welcome-banner h2 {
+    letter-spacing: 0 !important;
+}
+
+.banner-stats {
+    background: rgba(255, 255, 255, 0.16) !important;
+    border: 1px solid rgba(255, 255, 255, 0.22) !important;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18) !important;
+}
+
+.stat-card,
+.stat {
+    position: relative;
+    overflow: hidden;
+}
+
+.stat-card::before,
+.stat::before {
+    content: "";
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 4px;
+    background: linear-gradient(90deg, var(--lr-green), var(--lr-blue), var(--lr-teal));
+}
+
+.stat-value,
+.metric-value,
+.kpi-value {
+    color: var(--lr-ink) !important;
+    letter-spacing: 0 !important;
+}
+
+.stat-label,
+.metric-label,
+.kpi-label,
+.muted,
+.small {
+    color: var(--lr-muted) !important;
+}
+
+.stat-icon,
+.action-icon,
+.metric-icon {
+    border-radius: 14px !important;
+    box-shadow: 0 12px 24px rgba(28, 52, 84, 0.15) !important;
+}
+
+.stat-icon.courses,
+.action-icon.live {
+    background: linear-gradient(135deg, var(--lr-green), #0a5f3e) !important;
+}
+
+.stat-icon.classes,
+.action-icon.records {
+    background: linear-gradient(135deg, var(--lr-blue), #2748b0) !important;
+}
+
+.stat-icon.students,
+.action-icon.reports {
+    background: linear-gradient(135deg, var(--lr-teal), #0f766e) !important;
+}
+
+.stat-icon.risk,
+.action-icon.calendar {
+    background: linear-gradient(135deg, var(--lr-gold), #b86b12) !important;
+}
+
+.action-card {
+    border: 1px solid rgba(220, 230, 242, 0.92) !important;
+    border-radius: var(--lr-radius) !important;
+    background: rgba(255, 255, 255, 0.86) !important;
+}
+
+.btn,
+button,
+.filter-select,
+input,
+select,
+textarea,
+.form-control {
+    border-radius: var(--lr-radius-sm) !important;
+}
+
+.btn,
+button {
+    font-weight: 800 !important;
+    transition: transform 0.18s ease, box-shadow 0.18s ease, opacity 0.18s ease !important;
+}
+
+.btn-primary,
+.submit-btn,
+.primary-btn {
+    background: linear-gradient(135deg, var(--lr-green), var(--lr-blue)) !important;
+    border-color: transparent !important;
+    color: #fff !important;
+    box-shadow: 0 12px 26px rgba(67, 97, 238, 0.2) !important;
+}
+
+.btn-success {
+    background: linear-gradient(135deg, #16a34a, var(--lr-teal)) !important;
+    border-color: transparent !important;
+    color: #fff !important;
+}
+
+.btn-secondary,
+.btn-outline,
+.btn {
+    border-color: #cdd8e6 !important;
+}
+
+.btn:hover,
+button:hover {
+    transform: translateY(-1px);
+}
+
+input,
+select,
+textarea,
+.form-control,
+.filter-select {
+    background: rgba(255, 255, 255, 0.92) !important;
+    border-color: #d8e2ee !important;
+}
+
+input:focus,
+select:focus,
+textarea:focus,
+.form-control:focus,
+.filter-select:focus {
+    border-color: var(--lr-blue) !important;
+    box-shadow: 0 0 0 4px rgba(67, 97, 238, 0.12) !important;
+}
+
+table {
+    overflow: hidden;
+    border-radius: var(--lr-radius);
+}
+
+table th,
+thead th {
+    background: linear-gradient(135deg, #f8fafc, #eef6ff) !important;
+    color: #526174 !important;
+    font-size: 12px !important;
+    letter-spacing: 0.02em !important;
+}
+
+table td {
+    color: #1f2a3b;
+    border-color: #edf2f7 !important;
+}
+
+tbody tr:hover {
+    background: #f7fbff !important;
+}
+
+.badge,
+.status-badge,
+.status-pill {
+    border-radius: 999px !important;
+    font-weight: 800 !important;
+    border: 1px solid rgba(255, 255, 255, 0.7) !important;
+}
+
+.badge-present,
+.present,
+.ongoing,
+.good,
+.success {
+    background: #dcfce7 !important;
+    color: #166534 !important;
+}
+
+.badge-late,
+.late,
+.warn,
+.reminder,
+.scheduled {
+    background: #fef3c7 !important;
+    color: #92400e !important;
+}
+
+.badge-absent,
+.absent,
+.bad,
+.alert,
+.danger {
+    background: #fee2e2 !important;
+    color: #991b1b !important;
+}
+
+.session-row,
+.session-link,
+.schedule-row {
+    border-radius: var(--lr-radius-sm) !important;
+    border-color: var(--lr-soft-line) !important;
+}
+
+.session-row.active-row,
+.session-link.active {
+    border-color: rgba(0, 104, 55, 0.45) !important;
+    box-shadow: 0 0 0 4px rgba(0, 104, 55, 0.1), var(--lr-soft-shadow) !important;
+}
+
+.student-photo,
+.student-avatar,
+.profile-image,
+.avatar {
+    border: 2px solid #e7eef8 !important;
+    box-shadow: 0 8px 16px rgba(28, 52, 84, 0.1);
+}
+
+.scan-card {
+    border-color: #91dfb6 !important;
+    background:
+        linear-gradient(145deg, #ffffff, #f5fff9) !important;
+    box-shadow: 0 24px 60px rgba(0, 104, 55, 0.2) !important;
+}
+
+.scan-success-icon {
+    background: linear-gradient(135deg, var(--lr-green), #22c55e) !important;
+}
+
+.qr-box {
+    background: linear-gradient(135deg, #eff6ff, #ecfdf3) !important;
+    border-color: #bfdbfe !important;
+}
+
+.footer {
+    color: var(--lr-muted) !important;
+}
+
+@media (max-width: 900px) {
+    .main-content {
+        padding: 18px !important;
+    }
+
+    .header,
+    .topbar {
+        border-radius: 14px !important;
+    }
+
+    .nav-item:hover,
+    .nav-item.active,
+    .nav-menu a:hover,
+    .nav-menu a.active,
+    .sidebar a:hover,
+    .sidebar a.active {
+        transform: none !important;
+    }
+}

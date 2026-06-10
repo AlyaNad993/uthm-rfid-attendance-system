@@ -1,0 +1,225 @@
+/* Shared lecturer pages theme */
+:root {
+    --lt-font: "Segoe UI", Arial, sans-serif;
+    --lt-ink: #111827;
+    --lt-muted: #64748b;
+    --lt-border: #d8e0ef;
+    --lt-surface: rgba(255, 255, 255, 0.94);
+    --lt-soft: #f8fbff;
+    --lt-primary: #4f46e5;
+    --lt-blue: #2563eb;
+    --lt-teal: #0f766e;
+    --lt-green: #16a34a;
+    --lt-amber: #d97706;
+    --lt-rose: #e11d48;
+    --lt-violet: #7c3aed;
+    --lt-cyan: #0891b2;
+    --lt-shadow: 0 14px 34px rgba(15, 23, 42, 0.10);
+}
+
+* {
+    font-family: var(--lt-font) !important;
+}
+
+.fa,
+.fas,
+.far,
+.fal,
+.fat,
+.fab,
+[class^="fa-"],
+[class*=" fa-"] {
+    font-family: "Font Awesome 6 Free", "Font Awesome 6 Brands" !important;
+}
+
+.fas,
+.fa-solid {
+    font-weight: 900 !important;
+}
+
+.far,
+.fa-regular {
+    font-weight: 400 !important;
+}
+
+.fab,
+.fa-brands {
+    font-weight: 400 !important;
+}
+
+body {
+    background:
+        linear-gradient(135deg, rgba(79, 70, 229, 0.16), rgba(8, 145, 178, 0.12) 32%, rgba(22, 163, 74, 0.10) 62%, rgba(217, 119, 6, 0.14)),
+        #f6f8fc !important;
+}
+
+.page {
+    position: relative;
+}
+
+.topbar {
+    padding: 18px 20px;
+    background:
+        linear-gradient(120deg, rgba(255, 255, 255, 0.96), rgba(239, 246, 255, 0.92)),
+        var(--lt-surface);
+    border: 1px solid var(--lt-border);
+    border-radius: 8px;
+    box-shadow: var(--lt-shadow);
+}
+
+h1 {
+    color: var(--lt-ink) !important;
+}
+
+h1::after {
+    content: "";
+    display: block;
+    width: 72px;
+    height: 4px;
+    margin-top: 10px;
+    border-radius: 999px;
+    background: linear-gradient(90deg, var(--lt-primary), var(--lt-cyan), var(--lt-green), var(--lt-amber), var(--lt-rose));
+}
+
+.muted {
+    color: var(--lt-muted) !important;
+}
+
+.card,
+.panel,
+.stat,
+.notice,
+.session-list-card,
+.filter,
+.list,
+.empty {
+    background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(248, 251, 255, 0.94)),
+        var(--lt-surface) !important;
+    border: 1px solid var(--lt-border) !important;
+    border-radius: 8px !important;
+    box-shadow: var(--lt-shadow) !important;
+}
+
+.card-header,
+.panel-header {
+    background: linear-gradient(90deg, rgba(79, 70, 229, 0.12), rgba(8, 145, 178, 0.10), rgba(22, 163, 74, 0.08)) !important;
+    border-bottom-color: rgba(79, 70, 229, 0.16) !important;
+}
+
+.stat:nth-child(1),
+.stat-card:nth-child(1) {
+    border-top: 4px solid var(--lt-primary) !important;
+}
+
+.stat:nth-child(2),
+.stat-card:nth-child(2) {
+    border-top: 4px solid var(--lt-cyan) !important;
+}
+
+.stat:nth-child(3),
+.stat-card:nth-child(3) {
+    border-top: 4px solid var(--lt-green) !important;
+}
+
+.stat:nth-child(4),
+.stat-card:nth-child(4) {
+    border-top: 4px solid var(--lt-amber) !important;
+}
+
+.stat:nth-child(5) {
+    border-top: 4px solid var(--lt-rose) !important;
+}
+
+.stat:nth-child(6) {
+    border-top: 4px solid var(--lt-violet) !important;
+}
+
+.btn {
+    border-radius: 8px !important;
+    transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+.btn:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 8px 18px rgba(15, 23, 42, 0.10);
+}
+
+.btn-primary {
+    background: linear-gradient(135deg, var(--lt-primary), var(--lt-blue)) !important;
+    border-color: transparent !important;
+    color: #fff !important;
+}
+
+.btn-success {
+    background: linear-gradient(135deg, var(--lt-green), var(--lt-teal)) !important;
+    border-color: transparent !important;
+    color: #fff !important;
+}
+
+.badge {
+    border: 1px solid rgba(37, 99, 235, 0.12);
+}
+
+.badge-present,
+.good,
+.present,
+.attendance,
+.ongoing {
+    background: #dcfce7 !important;
+    color: #166534 !important;
+}
+
+.badge-late,
+.warn,
+.late,
+.reminder {
+    background: #fef3c7 !important;
+    color: #92400e !important;
+}
+
+.badge-absent,
+.bad,
+.absent,
+.alert,
+.cancelled {
+    background: #fee2e2 !important;
+    color: #991b1b !important;
+}
+
+.session-row,
+.session-link,
+.notification,
+.schedule-row {
+    transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+.session-row:hover,
+.session-link:hover,
+.notification:hover,
+.schedule-row:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 10px 22px rgba(15, 23, 42, 0.08);
+}
+
+.session-row.active-row,
+.session-link.active,
+.notification.unread {
+    border-color: rgba(79, 70, 229, 0.55) !important;
+    box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.13), var(--lt-shadow) !important;
+}
+
+table th {
+    background: linear-gradient(90deg, rgba(241, 245, 249, 0.98), rgba(239, 246, 255, 0.98)) !important;
+}
+
+table tbody tr:hover {
+    background: #f8fbff;
+}
+
+input:focus,
+select:focus {
+    outline: none;
+    border-color: rgba(79, 70, 229, 0.75) !important;
+    box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.12);
+}

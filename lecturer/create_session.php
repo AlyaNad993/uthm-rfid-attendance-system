@@ -2,6 +2,8 @@
 require_once '../includes/auth_check.php';
 requireLecturer();
 require_once '../includes/config.php';
+require_once '../includes/attendance_features.php';
+ensureAttendanceFeatureSchema($pdo);
 
 $lecturerId = (int)$_SESSION['user_id'];
 $selectedScheduleId = (int)($_POST['schedule_id'] ?? $_GET['schedule_id'] ?? 0);
@@ -12,6 +14,9 @@ $stmt = $pdo->prepare("
     SELECT
         cs.schedule_id,
         cs.course_id,
+        cs.section_name,
+        cs.academic_year,
+        cs.semester_label,
         cs.start_time,
         cs.end_time,
         c.course_code,
@@ -28,11 +33,16 @@ $stmt = $pdo->prepare("
 $stmt->execute([$lecturerId]);
 $schedules = $stmt->fetchAll();
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
     $scheduleId = $selectedScheduleId;
     $sessionDate = trim($_POST['session_date'] ?? '');
     $startTime = trim($_POST['start_time'] ?? '');
     $endTime = trim($_POST['end_time'] ?? '');
+    $attendanceMethod = trim($_POST['attendance_method'] ?? 'rfid');
+
+    if (!in_array($attendanceMethod, ['rfid', 'qr', 'both'], true)) {
+        $attendanceMethod = 'rfid';
+    }
 
     if (!$scheduleId || $sessionDate === '' || $startTime === '' || $endTime === '') {
         $error = 'Please fill in all fields.';
@@ -54,17 +64,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $error = 'Selected class schedule was not found.';
         } else {
             $stmt = $pdo->prepare("
-                SELECT session_id, session_status
+                SELECT session_id, planned_start_time, planned_end_time, session_status
                 FROM attendance_sessions
                 WHERE schedule_id = ?
                   AND session_date = ?
+                  AND session_status <> 'cancelled'
+                  AND NOT (
+                      planned_end_time <= ?
+                      OR planned_start_time >= ?
+                  )
                 LIMIT 1
             ");
-            $stmt->execute([$scheduleId, $sessionDate]);
-            $existingSession = $stmt->fetch();
+            $stmt->execute([$scheduleId, $sessionDate, $startTime, $endTime]);
+            $overlappingSession = $stmt->fetch();
 
-            if ($existingSession && $existingSession['session_status'] === 'completed') {
-                $error = 'A completed session already exists for this class and date. Choose another date, or review the completed session.';
+            if ($overlappingSession) {
+                $error = 'This time overlaps with another session for the same class on this date.';
             }
         }
 
@@ -73,6 +88,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 SELECT COUNT(*)
                 FROM enrollments e
                 JOIN class_schedule cs ON e.course_id = cs.course_id
+                                      AND e.section_name = cs.section_name
+                                      AND COALESCE(e.academic_year, '') = COALESCE(cs.academic_year, '')
                 WHERE cs.schedule_id = ?
                   AND e.status = 'registered'
             ");
@@ -80,34 +97,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $totalExpected = (int)$stmt->fetchColumn();
 
             try {
-                $stmt = $pdo->prepare("
-                    INSERT INTO attendance_sessions
-                        (schedule_id, lecturer_id, session_date, planned_start_time, planned_end_time, session_status, total_expected, total_present, total_late, total_absent)
-                    VALUES
-                        (?, ?, ?, ?, ?, 'scheduled', ?, 0, 0, 0)
-                    ON DUPLICATE KEY UPDATE
-                        lecturer_id = VALUES(lecturer_id),
-                        planned_start_time = VALUES(planned_start_time),
-                        planned_end_time = VALUES(planned_end_time),
-                        session_status = 'scheduled',
-                        total_expected = VALUES(total_expected)
-                ");
-                $stmt->execute([$scheduleId, $lecturerId, $sessionDate, $startTime, $endTime, $totalExpected]);
+                $qrToken = in_array($attendanceMethod, ['qr', 'both'], true) ? generateQrToken() : null;
+                $qrExpiresAt = $qrToken ? $sessionDate . ' ' . $endTime . ':00' : null;
 
                 $stmt = $pdo->prepare("
-                    SELECT session_id
-                    FROM attendance_sessions
-                    WHERE schedule_id = ?
-                      AND session_date = ?
-                    LIMIT 1
+                    INSERT INTO attendance_sessions
+                        (schedule_id, lecturer_id, session_date, planned_start_time, planned_end_time, session_status, attendance_method, qr_token, qr_expires_at, total_expected, total_present, total_late, total_absent)
+                    VALUES
+                        (?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, 0, 0, 0)
                 ");
-                $stmt->execute([$scheduleId, $sessionDate]);
-                $sessionId = (int)$stmt->fetchColumn();
+                $stmt->execute([$scheduleId, $lecturerId, $sessionDate, $startTime, $endTime, $attendanceMethod, $qrToken, $qrExpiresAt, $totalExpected]);
+
+                $sessionId = (int)$pdo->lastInsertId();
 
                 header("Location: live_attendance.php?session_id=" . $sessionId);
                 exit;
             } catch (PDOException $e) {
-                $error = 'Unable to create session: ' . $e->getMessage();
+                if ($e->getCode() === '23000') {
+                    $error = 'A session with the same class, date, start time, and end time already exists.';
+                } else {
+                    $error = 'Unable to create session: ' . $e->getMessage();
+                }
             }
         }
     }
@@ -150,6 +160,31 @@ function e($value) {
             padding: 22px;
         }
         .form-grid { display: grid; gap: 18px; }
+        .class-preview {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 12px;
+            margin-top: 12px;
+        }
+        .preview-item {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 10px;
+            padding: 12px;
+        }
+        .preview-label {
+            color: #64748b;
+            font-size: 12px;
+            font-weight: 800;
+            text-transform: uppercase;
+            margin-bottom: 5px;
+        }
+        .preview-value {
+            color: #111827;
+            font-size: 14px;
+            font-weight: 800;
+            line-height: 1.35;
+        }
         label {
             display: block;
             margin-bottom: 8px;
@@ -202,8 +237,12 @@ function e($value) {
             .time-grid { display: block; }
             .actions { margin-top: 14px; }
             .time-grid > div + div { margin-top: 18px; }
+            .class-preview { grid-template-columns: 1fr; }
         }
     </style>
+    <link rel="stylesheet" href="../assets/css/lecturer-theme.css">
+    <link rel="stylesheet" href="../assets/css/app-polish.css">
+    <link rel="stylesheet" href="../assets/css/lecturer-polish.css">
 </head>
 <body>
     <main class="page">
@@ -236,13 +275,34 @@ function e($value) {
                                     value="<?= e($schedule['schedule_id']) ?>"
                                     data-start="<?= e(substr($schedule['start_time'], 0, 5)) ?>"
                                     data-end="<?= e(substr($schedule['end_time'], 0, 5)) ?>"
+                                    data-subject="<?= e($schedule['course_code'] . ' - ' . $schedule['course_name']) ?>"
+                                    data-section="<?= e($schedule['section_name'] ?: 'Section 1') ?>"
+                                    data-semester="<?= e($schedule['semester_label'] ?: '-') ?>"
+                                    data-room="<?= e($schedule['room_code'] ?: $schedule['room_name'] ?: 'Room TBA') ?>"
                                     <?= $selectedScheduleId === (int)$schedule['schedule_id'] ? 'selected' : '' ?>
                                 >
                                     <?= e($schedule['course_code'] . ' - ' . $schedule['course_name']) ?>
-                                    <?= $schedule['room_code'] ? ' | ' . e($schedule['room_code']) : '' ?>
                                 </option>
                             <?php endforeach; ?>
                         </select>
+                        <div class="class-preview" id="classPreview" style="display: none;">
+                            <div class="preview-item">
+                                <div class="preview-label">Subject</div>
+                                <div class="preview-value" id="previewSubject">-</div>
+                            </div>
+                            <div class="preview-item">
+                                <div class="preview-label">Section</div>
+                                <div class="preview-value" id="previewSection">-</div>
+                            </div>
+                            <div class="preview-item">
+                                <div class="preview-label">Semester</div>
+                                <div class="preview-value" id="previewSemester">-</div>
+                            </div>
+                            <div class="preview-item">
+                                <div class="preview-label">Room / Time</div>
+                                <div class="preview-value" id="previewRoomTime">-</div>
+                            </div>
+                        </div>
                     </div>
 
                     <div>
@@ -261,6 +321,15 @@ function e($value) {
                         </div>
                     </div>
 
+                    <div>
+                        <label for="attendance_method">Attendance Method</label>
+                        <select id="attendance_method" name="attendance_method" required>
+                            <option value="rfid">RFID Card - physical class</option>
+                            <option value="qr">QR Code - online class</option>
+                            <option value="both">RFID or QR Code - hybrid class</option>
+                        </select>
+                    </div>
+
                     <div class="actions">
                         <button class="btn btn-primary" type="submit">Create Session</button>
                         <a class="btn" href="dashboard.php">Cancel</a>
@@ -274,6 +343,27 @@ function e($value) {
         const scheduleSelect = document.getElementById('schedule_id');
         const startInput = document.getElementById('start_time');
         const endInput = document.getElementById('end_time');
+        const classPreview = document.getElementById('classPreview');
+        const previewSubject = document.getElementById('previewSubject');
+        const previewSection = document.getElementById('previewSection');
+        const previewSemester = document.getElementById('previewSemester');
+        const previewRoomTime = document.getElementById('previewRoomTime');
+
+        function updateClassPreview(option) {
+            if (!option || !option.value) {
+                if (classPreview) classPreview.style.display = 'none';
+                return;
+            }
+
+            if (previewSubject) previewSubject.textContent = option.dataset.subject || '-';
+            if (previewSection) previewSection.textContent = option.dataset.section || '-';
+            if (previewSemester) previewSemester.textContent = option.dataset.semester || '-';
+            if (previewRoomTime) {
+                const time = option.dataset.start && option.dataset.end ? `${option.dataset.start} - ${option.dataset.end}` : '-';
+                previewRoomTime.textContent = `${option.dataset.room || 'Room TBA'} | ${time}`;
+            }
+            if (classPreview) classPreview.style.display = 'grid';
+        }
 
         if (scheduleSelect) {
             if (scheduleSelect.value) {
@@ -282,6 +372,7 @@ function e($value) {
                     startInput.value = option.dataset.start;
                     endInput.value = option.dataset.end;
                 }
+                updateClassPreview(option);
             }
 
             scheduleSelect.addEventListener('change', () => {
@@ -290,6 +381,7 @@ function e($value) {
                     startInput.value = option.dataset.start;
                     endInput.value = option.dataset.end;
                 }
+                updateClassPreview(option);
             });
         }
     </script>

@@ -34,7 +34,7 @@ try {
         FROM attendance_records ar
         JOIN attendance_sessions a_sess ON ar.session_id = a_sess.session_id
         WHERE DATE(a_sess.session_date) = ? 
-        AND ar.status IN ('present', 'late')
+        AND ar.status = 'present'
     ");
     $stmt->execute([$today, $today]);
     $attendance = $stmt->fetch();

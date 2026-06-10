@@ -6,6 +6,39 @@ if ($conn->connect_error) {
     exit;
 }
 
+function scanColumnExists(mysqli $conn, string $table, string $column): bool {
+    $safeTable = preg_replace('/[^A-Za-z0-9_]/', '', $table);
+    $result = $conn->query("SHOW COLUMNS FROM `$safeTable`");
+
+    if (!$result) {
+        return false;
+    }
+
+    while ($row = $result->fetch_assoc()) {
+        if (($row['Field'] ?? '') === $column) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+if (!scanColumnExists($conn, 'class_schedule', 'section_name')) {
+    $conn->query("ALTER TABLE class_schedule ADD section_name VARCHAR(30) NOT NULL DEFAULT 'Section 1' AFTER lecturer_id");
+}
+if (!scanColumnExists($conn, 'class_schedule', 'academic_year')) {
+    $conn->query("ALTER TABLE class_schedule ADD academic_year VARCHAR(20) NULL AFTER section_name");
+}
+if (!scanColumnExists($conn, 'class_schedule', 'semester_label')) {
+    $conn->query("ALTER TABLE class_schedule ADD semester_label VARCHAR(60) NULL AFTER academic_year");
+}
+if (!scanColumnExists($conn, 'enrollments', 'section_name')) {
+    $conn->query("ALTER TABLE enrollments ADD section_name VARCHAR(30) NOT NULL DEFAULT 'Section 1' AFTER course_id");
+}
+if (!scanColumnExists($conn, 'enrollments', 'academic_year')) {
+    $conn->query("ALTER TABLE enrollments ADD academic_year VARCHAR(20) NULL AFTER section_name");
+}
+
 if (!isset($_GET['uid'])) {
     echo "NO_UID";
     exit;
@@ -38,8 +71,11 @@ $sqlSession = "SELECT s.session_id, s.session_status, s.planned_start_time, s.pl
                FROM attendance_sessions s
                JOIN class_schedule cs ON s.schedule_id = cs.schedule_id
                JOIN enrollments e ON e.course_id = cs.course_id
+                                  AND e.section_name = cs.section_name
+                                  AND COALESCE(e.academic_year, '') = COALESCE(cs.academic_year, '')
                WHERE s.session_date = CURDATE()
                AND s.session_status IN ('scheduled', 'ongoing')
+               AND s.attendance_method IN ('rfid', 'both')
                AND NOW() BETWEEN CONCAT(s.session_date, ' ', s.planned_start_time)
                              AND CONCAT(s.session_date, ' ', s.planned_end_time)
                AND e.student_id = ?
@@ -109,10 +145,7 @@ $sqlUpdateTotals = "UPDATE attendance_sessions
                             AND status = 'present'
                         ),
                         total_late = (
-                            SELECT COUNT(*)
-                            FROM attendance_records
-                            WHERE session_id = ?
-                            AND status = 'late'
+                            0
                         ),
                         total_absent = (
                             SELECT COUNT(*)
@@ -123,7 +156,7 @@ $sqlUpdateTotals = "UPDATE attendance_sessions
                     WHERE session_id = ?";
 
 $stmtUpdateTotals = $conn->prepare($sqlUpdateTotals);
-$stmtUpdateTotals->bind_param("iiii", $session_id, $session_id, $session_id, $session_id);
+$stmtUpdateTotals->bind_param("iii", $session_id, $session_id, $session_id);
 $stmtUpdateTotals->execute();
 
 echo "SUCCESS|" . $student['full_name'] . "|" . $student['matric_no'];

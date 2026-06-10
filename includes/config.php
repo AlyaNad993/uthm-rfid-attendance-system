@@ -20,7 +20,8 @@ try {
         [
             PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-            PDO::ATTR_EMULATE_PREPARES => false
+            PDO::ATTR_EMULATE_PREPARES => false,
+            PDO::MYSQL_ATTR_USE_BUFFERED_QUERY => true
         ]
     );
 } catch (PDOException $e) {
@@ -29,5 +30,5 @@ try {
 
 // Site Configuration
 define('SITE_NAME', 'UTHM RFID Attendance System');
-define('SITE_URL', 'http://localhost/uthm_rfid_attendance/');
+define('SITE_URL', 'http://172.20.10.2/uthm_rfid_attendance/');
 ?>
