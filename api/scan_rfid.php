@@ -1,9 +1,8 @@
 <?php
-require_once __DIR__ . '/../config.php';
+require_once __DIR__ . '/../includes/config.php';
 
 header('Content-Type: text/plain');
 
-// Create MySQLi connection using config.php constants
 mysqli_report(MYSQLI_REPORT_OFF);
 
 $conn = new mysqli(
@@ -126,7 +125,7 @@ if ($sessionResult->num_rows == 0) {
 
 $session = $sessionResult->fetch_assoc();
 
-$rfid_card_id = (int) $student['card_id'];
+$rfid_card_id = $student['card_id'];
 $session_id = (int) $session['session_id'];
 
 if ($session['session_status'] === 'scheduled') {
@@ -179,10 +178,10 @@ if (!$stmtInsert) {
     exit;
 }
 
-$stmtInsert->bind_param("iii", $session_id, $student_id, $rfid_card_id);
+$stmtInsert->bind_param("iis", $session_id, $student_id, $rfid_card_id);
 
 if (!$stmtInsert->execute()) {
-    echo "INSERT_FAILED";
+    echo "INSERT_FAILED|" . $stmtInsert->error;
     exit;
 }
 
