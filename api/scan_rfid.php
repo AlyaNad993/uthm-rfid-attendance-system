@@ -1,10 +1,25 @@
 <?php
-$conn = new mysqli("localhost", "root", "", "uthm_rfid_attendance");
+require_once __DIR__ . '/../config.php';
+
+header('Content-Type: text/plain');
+
+// Create MySQLi connection using config.php constants
+mysqli_report(MYSQLI_REPORT_OFF);
+
+$conn = new mysqli(
+    DB_HOST,
+    DB_USER,
+    DB_PASS,
+    DB_NAME,
+    (int) DB_PORT
+);
 
 if ($conn->connect_error) {
     echo "DB_ERROR";
     exit;
 }
+
+$conn->set_charset("utf8mb4");
 
 function scanColumnExists(mysqli $conn, string $table, string $column): bool {
     $safeTable = preg_replace('/[^A-Za-z0-9_]/', '', $table);
@@ -26,20 +41,24 @@ function scanColumnExists(mysqli $conn, string $table, string $column): bool {
 if (!scanColumnExists($conn, 'class_schedule', 'section_name')) {
     $conn->query("ALTER TABLE class_schedule ADD section_name VARCHAR(30) NOT NULL DEFAULT 'Section 1' AFTER lecturer_id");
 }
+
 if (!scanColumnExists($conn, 'class_schedule', 'academic_year')) {
     $conn->query("ALTER TABLE class_schedule ADD academic_year VARCHAR(20) NULL AFTER section_name");
 }
+
 if (!scanColumnExists($conn, 'class_schedule', 'semester_label')) {
     $conn->query("ALTER TABLE class_schedule ADD semester_label VARCHAR(60) NULL AFTER academic_year");
 }
+
 if (!scanColumnExists($conn, 'enrollments', 'section_name')) {
     $conn->query("ALTER TABLE enrollments ADD section_name VARCHAR(30) NOT NULL DEFAULT 'Section 1' AFTER course_id");
 }
+
 if (!scanColumnExists($conn, 'enrollments', 'academic_year')) {
     $conn->query("ALTER TABLE enrollments ADD academic_year VARCHAR(20) NULL AFTER section_name");
 }
 
-if (!isset($_GET['uid'])) {
+if (!isset($_GET['uid']) || trim($_GET['uid']) === '') {
     echo "NO_UID";
     exit;
 }
@@ -55,6 +74,12 @@ $sql = "SELECT rc.card_id, rc.user_id, u.full_name, u.matric_no
         LIMIT 1";
 
 $stmt = $conn->prepare($sql);
+
+if (!$stmt) {
+    echo "DB_ERROR";
+    exit;
+}
+
 $stmt->bind_param("s", $uid);
 $stmt->execute();
 $result = $stmt->get_result();
@@ -65,7 +90,7 @@ if ($result->num_rows == 0) {
 }
 
 $student = $result->fetch_assoc();
-$student_id = $student['user_id'];
+$student_id = (int) $student['user_id'];
 
 $sqlSession = "SELECT s.session_id, s.session_status, s.planned_start_time, s.planned_end_time
                FROM attendance_sessions s
@@ -84,6 +109,12 @@ $sqlSession = "SELECT s.session_id, s.session_status, s.planned_start_time, s.pl
                LIMIT 1";
 
 $stmtSession = $conn->prepare($sqlSession);
+
+if (!$stmtSession) {
+    echo "DB_ERROR";
+    exit;
+}
+
 $stmtSession->bind_param("i", $student_id);
 $stmtSession->execute();
 $sessionResult = $stmtSession->get_result();
@@ -95,8 +126,8 @@ if ($sessionResult->num_rows == 0) {
 
 $session = $sessionResult->fetch_assoc();
 
-$rfid_card_id = $student['card_id'];
-$session_id = $session['session_id'];
+$rfid_card_id = (int) $student['card_id'];
+$session_id = (int) $session['session_id'];
 
 if ($session['session_status'] === 'scheduled') {
     $sqlStartSession = "UPDATE attendance_sessions
@@ -105,6 +136,12 @@ if ($session['session_status'] === 'scheduled') {
                         WHERE session_id = ?";
 
     $stmtStartSession = $conn->prepare($sqlStartSession);
+
+    if (!$stmtStartSession) {
+        echo "DB_ERROR";
+        exit;
+    }
+
     $stmtStartSession->bind_param("i", $session_id);
     $stmtStartSession->execute();
 }
@@ -116,6 +153,12 @@ $sqlCheck = "SELECT record_id
              LIMIT 1";
 
 $stmtCheck = $conn->prepare($sqlCheck);
+
+if (!$stmtCheck) {
+    echo "DB_ERROR";
+    exit;
+}
+
 $stmtCheck->bind_param("ii", $session_id, $student_id);
 $stmtCheck->execute();
 $checkResult = $stmtCheck->get_result();
@@ -130,7 +173,13 @@ $sqlInsert = "INSERT INTO attendance_records
               VALUES (?, ?, ?, NOW(), 'present', 0, 0)";
 
 $stmtInsert = $conn->prepare($sqlInsert);
-$stmtInsert->bind_param("iis", $session_id, $student_id, $rfid_card_id);
+
+if (!$stmtInsert) {
+    echo "DB_ERROR";
+    exit;
+}
+
+$stmtInsert->bind_param("iii", $session_id, $student_id, $rfid_card_id);
 
 if (!$stmtInsert->execute()) {
     echo "INSERT_FAILED";
@@ -144,9 +193,7 @@ $sqlUpdateTotals = "UPDATE attendance_sessions
                             WHERE session_id = ?
                             AND status = 'present'
                         ),
-                        total_late = (
-                            0
-                        ),
+                        total_late = 0,
                         total_absent = (
                             SELECT COUNT(*)
                             FROM attendance_records
@@ -156,8 +203,15 @@ $sqlUpdateTotals = "UPDATE attendance_sessions
                     WHERE session_id = ?";
 
 $stmtUpdateTotals = $conn->prepare($sqlUpdateTotals);
+
+if (!$stmtUpdateTotals) {
+    echo "DB_ERROR";
+    exit;
+}
+
 $stmtUpdateTotals->bind_param("iii", $session_id, $session_id, $session_id);
 $stmtUpdateTotals->execute();
 
 echo "SUCCESS|" . $student['full_name'] . "|" . $student['matric_no'];
+exit;
 ?>

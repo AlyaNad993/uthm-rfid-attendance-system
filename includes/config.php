@@ -1,5 +1,4 @@
 <?php
-define('DB_HOST', $databaseHost);
 // Database Configuration
 // Support Railway's injected connection string. Create a service variable
 // (e.g. `MYSQL_URL`) with the value `${{ MySQL.MYSQL_URL }}` and this code
@@ -25,9 +24,9 @@ if ($mysqlUrl) {
     }
 
     $dbHost = $databaseHost;
-    $dbName = getenv('DB_NAME') ?: 'uthm_rfid_attendance';
-    $dbUser = getenv('DB_USER') ?: 'root';
-    $dbPass = getenv('DB_PASS') ?: '';
+    $dbName = getenv('DB_NAME') ?: 'di230078';
+    $dbUser = getenv('DB_USER') ?: 'di230078';
+    $dbPass = getenv('DB_PASS') ?: 'di230078';
     $dbPort = $databasePort;
 }
 
@@ -72,5 +71,5 @@ try {
 
 // Site Configuration
 define('SITE_NAME', 'UTHM RFID Attendance System');
-define('SITE_URL', getenv('SITE_URL') ?: 'http://172.20.10.2/uthm_rfid_attendance/');
+define('SITE_URL', getenv('SITE_URL') ?: 'http://172.20.10.2/di230078/');
 ?>
